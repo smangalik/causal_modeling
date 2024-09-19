@@ -1,3 +1,7 @@
+# Plotting folders
+county_did_plots/
+covid_plots/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
