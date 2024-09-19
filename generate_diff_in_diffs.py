@@ -3,6 +3,7 @@ load the virtual environment: `source /data/smangalik/myenvs/diff_in_diff/bin/ac
 run as `python3.5 generate_diff_in_diffs.py` or `python3.5 generate_diff_in_diffs.py topics`
 """
 
+import sys  # noqa: F401
 from typing import List, Tuple
 from pymysql import cursors, connect # type: ignore
 from collections import defaultdict
@@ -19,7 +20,6 @@ import pandas as pd
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-from scipy import stats
 
 
 # Ignore warnings
@@ -52,7 +52,7 @@ county_factors_table = "ctlb2.county_PESH_2020"
 county_factors_fields = "perc_republican_president_2016, perc_republican_president_2020, perc_other_president_2020, PercPop25OverBachelorDeg_census19, Log10MedianHouseholdIncome_chr20, UnemploymentRate_bls20, PercHomeowners_chr20, SocialAssociationRate_chr20, ViolentCrimeRate_chr20, PercFairOrPoorHealth_chr20, AgeAdjustedDeathRate_chr20, SuicideRateAgeAdjusted_chr20, PercDisconnectedYouth_chr20"
 
 # Number of principal componenets used in PCA
-pca_components = 10
+pca_components = 3
 
 # How many of the top populous counties we want to keep
 top_county_count = 500 # 3232 is the maximum number, has a serious effect on results
@@ -91,24 +91,28 @@ with open("/data/smangalik/countyFirsts.csv") as countyFirsts:
       if firstDeath != "":
         first_covid_death[fips] = [datetime.datetime.strptime(firstDeath, '%Y-%m-%d'),None,"First Covid Death"]
 
-# Populate county adjacency list into a binary numpy array
+# Populate county adjacency list with all adjacent counties
 print("Loading county adjacency list")
 county_adjacency = {}
 with open("/users2/smangalik/causal_modeling/county_adjacency_2024.txt") as countyAdjacency:
     lines = countyAdjacency.read().splitlines()[1:] # read and skip header
-    possible_geo_ids = set()
-    for line in lines:
-      county_name, geo_id, neighbor_name, neighbor_geo_id = line.split("|")
-      possible_geo_ids.add(geo_id)
-    possible_geo_ids = sorted(list(possible_geo_ids))
     for line in tqdm(lines):
       county_name, geo_id, neighbor_name, neighbor_geo_id = line.split("|")
       if geo_id not in county_adjacency.keys():
-        county_adjacency[geo_id] = np.zeros(len(possible_geo_ids),dtype=np.float32)
-      neighbor_index = possible_geo_ids.index(neighbor_geo_id)
-      county_adjacency[geo_id][neighbor_index] = 1.0   
-print("Loaded adjacency list with",len(county_adjacency),"counties and",len(possible_geo_ids),"neighbors")
+        county_adjacency[geo_id] = {geo_id} # add self to adjacency list
+      county_adjacency[geo_id] = county_adjacency[geo_id].union({neighbor_geo_id})
+print("Loaded adjacency list with",len(county_adjacency),"counties")
 print("Example adjacency list for 01001",county_adjacency['01001'])
+
+# Populate lat/long for each county
+print("Loading county lat/long")
+county_lat_long = {}
+with open("/users2/smangalik/causal_modeling/uscounties_lat_long.csv") as countyLatLong:
+  lines = countyLatLong.read().splitlines()[1:] # read and skip header
+  for line in lines:
+    county_name,fips,state_iabbr,state_name,lat,long,population = line.split(",")
+    fips = str(fips).zfill(5)
+    county_lat_long[fips] = np.array([float(lat),float(long)])
 
 print('Connecting to MySQL...')
 
@@ -116,7 +120,7 @@ print('Connecting to MySQL...')
 connection  = connect(read_default_file="~/.my.cnf")
 
 # Get the 100 most populous counties
-def get_populous_counties(cursor, base_year) -> list:
+def get_populous_counties(cursor, base_year=2020) -> list:
   populous_counties = []
   sql = "select * from ctlb.counties{} order by num_of_users desc limit {};".format(base_year,top_county_count)
   cursor.execute(sql)
@@ -126,115 +130,98 @@ def get_populous_counties(cursor, base_year) -> list:
     populous_counties.append(cnty)
   return populous_counties
 
-# Get county features like [age, income, education, (race, ethnicity, well_being)]
-def get_county_factors(cursor, base_year, relevant_counties, normalize=False):
-  county_factors_height = len(relevant_counties) 
-  county_factors_width = len(county_factors_fields.split(',')) + len(possible_geo_ids)
-  county_factors = np.zeros((county_factors_height, county_factors_width))
+# Get the static factors for the most populous counties
+def get_static_factors(cursor, populous_counties, pca_components=pca_components):
+  demo_factors_height = len(populous_counties)
+  demo_factors_width = len(county_factors_fields.split(','))
+  demo_factors = np.zeros((demo_factors_height, demo_factors_width))
 
-  for i, cnty in enumerate(relevant_counties):
-      # # Get stats
-      # # TODO Use CTLB to get better stats on user tweets [cnty|num_users|num_tweets]
-      # sql = "select * from county_topic_change.msgs_100u_{} where cnty = {};".format(base_year,cnty)
-      # cursor.execute(sql)
-      # result = cursor.fetchone()
-      # if result is None:
-      #     continue
-      # cnty, num_users, num_tweets = result
-      # county_factors[i][0] = np.log(float(num_users)) # log number of users
-      # county_factors[i][1] = np.log(float(num_tweets)) # log number of tweets
-
-      # Get PESH factors
-      sql = "select {} from {} where cnty = {};".format(
-        county_factors_fields,
-        county_factors_table,
-        cnty
-      )
-      cursor.execute(sql)
-      result = cursor.fetchone()
-      demo_factors = np.asarray(result,dtype=np.float32)
-      
-      # Add adjacency list
-      county_adjacencies = county_adjacency.get(cnty,np.zeros(len(possible_geo_ids),dtype=np.float32))
-      
-      # Combine all factors
-      county_factors[i] = np.concatenate((demo_factors,county_adjacencies))
-
+  # Get PESH factors
+  for i, cnty in enumerate(populous_counties):
+    sql = "select {} from {} where cnty = {};".format(
+      county_factors_fields,
+      county_factors_table,
+      cnty
+    )
+    cursor.execute(sql)
+    result = cursor.fetchone()
+    # Write to demo_factors
+    demo_factors[i,] = np.asarray(result, dtype=np.float32)
   # replace NaNs with column means
-  for i in range(county_factors.shape[1]):
-    col = county_factors[:,i]
+  for i in range(demo_factors.shape[1]):
+    col = demo_factors[:,i]
     mean = np.nanmean(col)
-    col[np.isnan(col)] = mean
-  
-  relevant_counties = np.asarray(relevant_counties)
-
-  # Normalize columns of county_factors via z-score
-  if normalize:
-      county_factors = stats.zscore(county_factors, axis=0)
-      
-  # Fit a StandardScaler and transform the county factors
+    col[np.isnan(col)] = mean  
+  # Fit a StandardScaler and transform the demo factors
   scaler = StandardScaler()
-  scaler.fit(county_factors)
-  county_factors = scaler.transform(county_factors)
-
+  scaler.fit(demo_factors)
+  demo_factors = scaler.transform(demo_factors)
   # Take the PCA of the county factors to calculate neighbors
   pca = PCA(n_components=pca_components, random_state=0)
-  pca.fit(county_factors)
-  county_factors = pca.transform(county_factors)
+  pca.fit(demo_factors)
+  demo_factors = pca.transform(demo_factors)
+  
+  # Get Lat/Long factors
+  location_factors = np.zeros((len(populous_counties),2),dtype=np.float32)
+  for i, cnty in enumerate(populous_counties):
+    location_factors[i,] = county_lat_long.get(cnty,(0,0))
+  
+  # Combine all factors
+  static_factors = np.concatenate((demo_factors,location_factors),axis=1)
+  
+  return static_factors
+  
+
+# Get county features relative to some target county for all populous counties
+def get_county_factors(populous_counties, static_factors, target_county='36103', feat='DEP_SCORE'):
+  target_factors_height = len(populous_counties) 
+  target_factors_width = 2
+  target_factors = np.zeros((target_factors_height, target_factors_width))
+  
+  neighbors = NearestNeighbors(n_neighbors=k_neighbors)
+  
+  # Find the target county's before-event dates
+  blank_event = [None,None,None]
+  target_event_start, target_event_end, event_name = first_covid_case.get(target_county,blank_event)
+  if target_event_start is None:
+    county_factors = np.concatenate((static_factors, np.zeros((target_factors_height,1))),axis=1)
+    neighbors.fit(county_factors)
+    return county_factors, neighbors
+  target_before, target_after, dates_before, dates_after = feat_usage_before_and_after(target_county, feat, event_start=target_event_start, event_end=target_event_end)
+
+  for i, cnty in enumerate(populous_counties):
+    # Is the county adjacent to the target county?
+    adjacent_counties = county_adjacency.get(target_county,set())
+    county_adjacent = 1.0 if cnty in adjacent_counties else 0.0
+    
+    # What is the feature usage for the county before the event?
+    feat_score_before_event = avg_feat_usage_from_dates(county=cnty, dates=dates_before, feat=feat)
+    
+    # print("DEBUGGING COUNTY FACTORS")
+    # print("adjacent_counties",adjacent_counties,"county_adjacent",county_adjacent)
+    # print("feat_score_before_event",feat_score_before_event,"from",cnty,dates_before,feat)
+    
+    # Write to target_factors
+    target_factors[i,] = np.asarray([county_adjacent,feat_score_before_event], dtype=np.float32)
+    
+  # replace NaNs with column means
+  for i in range(target_factors.shape[1]):
+    col = target_factors[:,i]
+    mean = np.nanmean(col)
+    col[np.isnan(col)] = mean  
+    
+  # Combine static and target factors
+  county_factors = np.concatenate((static_factors,target_factors),axis=1)
 
   # Fit the nearest neighbors
-  neighbors = NearestNeighbors(n_neighbors=k_neighbors)
   neighbors.fit(county_factors)
 
-  return county_factors, neighbors, relevant_counties
-
-# Get category map from topic number to top words
-def get_topic_map(cursor) -> dict:
-  topic_map = {}
-  sql = 'select category, group_concat(term order by weight desc) as "terms" from dlatk_lexica.met_a30_2000_freq_t50ll group by category;'
-  cursor.execute(sql)
-  for result in cursor.fetchall():
-    category, terms = result
-    topic_map[category] = terms.split(',')[:10]
-  return topic_map
-
-# Iterate over all time units to create county_feats[county][year_week] = feats
-def get_county_feats(cursor, table_years):
-  county_feats = {}
-  for table_year in table_years:
-    print('Processing {}'.format(table_year))
-
-    # sql = "select * from ctlb2.feat$cat_met_a30_2000_cp_w$timelines{}$yw_cnty$1gra;".format(table_year)
-    sql = "select * from ctlb2.feat$dd_depAnxLex$timelines{}$yw_cnty$1gra;".format(table_year)
-    cursor.execute(sql)
-
-    for result in tqdm(cursor.fetchall_unbuffered()): # Read _unbuffered() to save memory
-      yw_county, feat, value, value_norm = result
-
-      if feat == '_int': 
-        continue
-      feat = int(feat)
-      yearweek, county = yw_county.split(":")
-      if county == "" or yearweek == "": 
-        continue
-      county = str(county).zfill(5)
-
-      # Store county_feats
-      if county_feats.get(county) is None:
-        county_feats[county] = {}
-      if county_feats[county].get(yearweek) is None:
-        county_feats[county][yearweek] = {}
-      try:
-        county_feats[county][yearweek][feat] = value_norm
-      except IndexError:
-        print("IndexError for",county,yearweek,feat)
-
-  return county_feats
+  return county_factors, neighbors
 
 # Returns the yearweek that the date is within
 def date_to_yearweek(d:datetime.datetime) -> str:
   year, weeknumber, weekday = d.date().isocalendar()
-  return str(year) + "_" + str(weeknumber)
+  return str(year) + "_" + str(weeknumber).zfill(2)
 
 # Returns the first and last day of a week given as "2020_11"
 def yearweek_to_dates(yw:str) -> Tuple[datetime.datetime, datetime.datetime]:
@@ -247,37 +234,31 @@ def yearweek_to_dates(yw:str) -> Tuple[datetime.datetime, datetime.datetime]:
   sunday = monday + datetime.timedelta(days=6)
   return monday, sunday
 
-# Take in a county and some yearweeks, then average their feat usage
-def avg_topic_usage_from_dates(county,dates) -> float:
-  feat_usages = []
-
-  for date in dates:
-    if county_feats.get(county) is not None and county_feats.get(county).get(date) is not None:
-      feats_for_date = np.array(county_feats[county][date]) * scale_factor # scale values and store
-      feat_usages.append(feats_for_date)
-
-  if len(feat_usages) == 0:
-    # print("No matching dates for", county, "on dates", dates)
-    return None
-
-  #print("feats_for_date",feats_for_date)
-  #print("feat_usages",feat_usages)
-
-  return np.mean(feat_usages)
-
 def avg_feat_usage_from_dates(county,dates,feat='DEP_SCORE') -> float:
   feat_usages = []
 
   for date in dates:
-    if county_feats.get(county) is not None and county_feats.get(county).get(date) is not None:
-      feats_for_date = np.array(county_feats[county][date][feat])
-      feat_usages.append(feats_for_date)
+    if county_feats.get(county,None) is not None:
+      if county_feats[county].get(date,None) is not None: 
+        if county_feats[county][date].get(feat,None) is not None:
+          feats_for_date = np.array(county_feats[county][date][feat])
+          feat_usages.append(feats_for_date)
+        else:
+          #print("No feature",feat,"for",county,"on",date)
+          pass
+      else:
+        #print("No date",date,"for",county)
+        pass
+    else:
+      #print("No county",county)
+      pass
 
   if len(feat_usages) == 0:
     # print("No matching dates for", county, "on dates", dates)
     return None
 
   return np.mean(feat_usages)
+
 
 def feat_usage_before_and_after(county, feat, event_start, event_end=None,
                                  before_start_window=default_before_start_window,
@@ -320,174 +301,122 @@ def feat_usage_before_and_after(county, feat, event_start, event_end=None,
   # Get average usage
   return avg_feat_usage_from_dates(county, before_dates, feat), avg_feat_usage_from_dates(county, after_dates, feat), before_dates, after_dates
 
-def plot_diff_in_diff_per_county():
-
-  for feat in list_features:
-    matches_before = np.array(matched_befores[target])
-    matches_after = np.array(matched_befores[target]) + np.array(matched_diffs[target])
-    avg_match_before = np.mean(matches_before)
-    avg_match_after = np.mean(matches_after)
-    std_match_before = np.std(matches_before)
-    std_match_after = np.std(matches_after)
-    stderr_match_before = std_match_before / np.sqrt(k_neighbors)
-    stderr_match_after = std_match_after / np.sqrt(k_neighbors)
-
-    is_significant = abs(intervention_effect) > stderr_match_after*ci_window
-    if not is_significant:
-      continue # only plot significant results
-
-    # List significant changes
-    increase_decrease = "increased" if intervention_effect > 0 else "decreased"
-    print("-> ", feat, increase_decrease, "significantly")
-
-    plt.clf() # reset plot
-
-    # Confidence Intervals
-    ci_down = [target_before-stderr_match_before, target_expected-stderr_match_after]
-    ci_up = [target_before+stderr_match_before, target_expected+stderr_match_after]
-    ci_down_2 = [target_before-stderr_match_before*ci_window, target_expected-stderr_match_after*ci_window]
-    ci_up_2 = [target_before+stderr_match_before*ci_window, target_expected+stderr_match_after*ci_window]
-
-    # Create Plot
-    fig, ax = plt.subplots()
-    fig.set_size_inches(6, 6)
-    plt.plot(x, [target_before, target_after], 'b-', label='Target (Observed)')
-    plt.plot(x, [target_before, target_expected],'c--', label='Target (Expected)')
-    #plt.plot([x[0]]*k_neighbors, matches_before, 'r+', alpha=0.2)
-    #plt.plot([x[1]]*k_neighbors, matches_after, 'r+', alpha=0.2)
-    plt.plot(x,[avg_match_before,avg_match_after],'r--',label='Average Match')
-    plt.fill_between(x, ci_down, ci_up, color='c', alpha=0.3)
-    plt.fill_between(x, ci_down_2, ci_up_2, color='c', alpha=0.2)
-    plt.plot([x[1],x[1]], [target_after, target_expected], 'k--', \
-      label='Intervention Effect ({}%)'.format(intervention_percent))
-    plt.title("County " + str(target) + " before/after " + event_name)
-
-    # Format plot
-    plt.gcf().autofmt_xdate()
-    ax.set_xticks(xticks)
-    ax.set_xticklabels([
-      "{} weeks before event".format(default_event_buffer + default_before_start_window + 1),
-      "{} week before event".format(default_event_buffer),
-      "{} week after event".format(default_event_buffer),
-      "{} weeks after event".format(default_event_buffer + default_after_end_window + 1)
-    ])
-    plt.xlabel("Time")
-    plt.ylabel(str(feat) + " Usage")
-    plt.legend()
-    plt.tight_layout()
-
-    plt_name = "did_feat_{}_cnty{}_time{}{}{}-{}{}{}.png".format( \
-      feat,target,x[0].year,x[0].month,x[0].day,x[1].year,x[0].month,x[0].day)
-
-    plt.savefig(plt_name)
-
 # Read in data with cursor
 with connection:
   with connection.cursor(cursors.SSCursor) as cursor:
     print('Connected to',connection.host)
 
     # Determine the relevant counties
-    base_year = 2019
-    #populous_counties = get_populous_counties(cursor, base_year)
     #print("\nCounties with the most users in {}".format(base_year),populous_counties[:25],"...")
     populous_counties = sorted(fips_to_population, key=fips_to_population.get, reverse=True)[:top_county_count]
     print("\nCounties with the most users in 2021",populous_counties[:25],"...")
 
-
-    # Create county_factor matrix and n-neighbors mdoel
-    county_factors, neighbors, populous_counties = get_county_factors(cursor, 2016, populous_counties)
-    print('\nCounty factor matrix shape:',county_factors.shape)
-
-    # Display nearest neighbors for first county
-    test_county = '36103' # Suffolk, NY
-    test_county = '40143' # Washington, DC
-    test_county_index = list(populous_counties).index(test_county)
-    print('\nTest county (',test_county,')\n',county_factors[test_county_index])
-    dist, n_neighbors = neighbors.kneighbors([county_factors[test_county_index]], 6, return_distance=True)
-    for i, n in enumerate(n_neighbors[0]):
-        print('The #{}'.format(i+1),'nearest County is',populous_counties[n],'with distance',dist[0][i])
-
-    # Map topics to their key words
-    if topics:
-      topic_map = get_topic_map(cursor)
-      print()
-      print('Topic 0    =',topic_map['0'])
-      print('Topic 344  =',topic_map['344'])
-      print('Topic 160  =',topic_map['160'])
-      print('Topic 1999 =',topic_map['1999'],'\n')
-
-
     # Load data from CSV
     df = pd.read_csv(data_file)
     df['cnty'] = df['cnty'].astype(str).str.zfill(5)
+    score_col = 'wavg_score'
     
     print("Data from CSV:", data_file)
     print(df)
     print("Columns:",df.columns.tolist())
 
     list_features = df['feat'].unique()
+    list_features = list_features[list_features != 'ANG_SCORE'] # TODO could re-enable this
+    
+    # Normalize wavg_score to be between 0 and 1 per county feature
+    df[score_col] = df.groupby(['cnty','feat'])[score_col].transform(lambda x: (x - x.min()) / (x.max() - x.min()))
     
     print("Loading Unique Features:",list_features)
     county_feats = defaultdict(lambda: defaultdict(dict))
     grouped = df.groupby(['feat', 'cnty', 'yearweek'])
     for (feat, county, yearweek), group in tqdm(grouped):
-        county_feats[county][yearweek][feat] = group['wavg_score'].iloc[0]
+        county_feats[county][yearweek][feat] = group[score_col].iloc[0]
     county_feats = {k: dict(v) for k, v in county_feats.items()} # Convert to a regular dict
     
-    print("county_feats['40143']['2020_19']['DEP_SCORE'] =",county_feats['40143']['2020_19']['DEP_SCORE'])
+    print("county_feats['40143']['2020_07']['DEP_SCORE'] =",county_feats['40143']['2020_07']['DEP_SCORE'])
+    print("county_feats['40143']['2020_08']['DEP_SCORE'] =",county_feats['40143']['2020_08']['DEP_SCORE'])
     print("county_feats['40143']['2020_20']['ANX_SCORE'] =",county_feats['40143']['2020_20']['ANX_SCORE'])
     print("county_feats['40143']['2020_20']['ANG_SCORE'] =",county_feats['40143']['2020_20']['ANG_SCORE'])
     available_yws = list(county_feats['40143'].keys())
     available_yws.sort()
     print("\nAvailable weeks for 40143:",  available_yws)
+    
+    # Display nearest neighbors for first county
+    #test_county = '36103' # Suffolk, NY
+    test_county = '40143' # Washington, DC
+    test_county_index = list(populous_counties).index(test_county)
+    
+    # Create county_factor matrix and n-neighbors mdoel
+    static_factors = get_static_factors(cursor, populous_counties)
+    # TODO dynamically determine the target county
+    sample_county_factors, sample_neighbors = get_county_factors(populous_counties, static_factors, target_county=test_county, feat='DEP_SCORE')
+    print("\nFactors for county {} = {}\n".format(test_county,sample_county_factors[test_county_index]))
+    dist, n_neighbors = sample_neighbors.kneighbors([sample_county_factors[test_county_index]], 6, return_distance=True)
+    for i, n in enumerate(n_neighbors[0]):
+        print('The #{}'.format(i+1),'nearest County is',populous_counties[n],'with distance',dist[0][i])
 
     # Get the closest k_neighbors for each populous_county we want to examine
     county_representation = {}
     matched_counties = {}
 
-    # Calculate Average and Weighted Average Topic Usage for Baselines
+    # Calculate Average and Weighted Average Weekly Feat Score for Baselines
     county_list = county_feats.keys() # all counties considered in order
     county_list_weights = [county_representation.get(c,1) for c in county_list] # weight based on neighbor count
-    avg_county_list_usages = {}
-    weighted_avg_county_list_usages = {}
-    for feat in list_features:
-      county_list_usages = [] # all averaged counties stacked
-      for county in county_list:
-        yearweeks = list(county_feats[county].keys())
-        county_list_usages.append( avg_feat_usage_from_dates(county,yearweeks,feat) )
-      avg_county_list_usages[feat] = np.average(county_list_usages)
-      weighted_avg_county_list_usages[feat] = np.average(county_list_usages, weights=county_list_weights)
+    avg_county_list_usages = {} # avg_county_list_usages[yearweek][feat] = average value
+    all_possible_yearweeks = sorted(df['yearweek'].unique().tolist())
+    for yearweek in all_possible_yearweeks:
+      for feat in list_features:
+        feat_usages = []
+        for county in county_list:
+          if county_feats.get(county,None) is not None:
+            if county_feats[county].get(yearweek,None) is not None: 
+              if county_feats[county][yearweek].get(feat,None) is not None:
+                feats_for_date = np.array(county_feats[county][yearweek][feat])
+                feat_usages.append(feats_for_date)
+        if len(feat_usages) == 0:
+          # print("No matching dates for", county, "on dates", dates)
+          continue
+        avg_county_list_usages[yearweek] = avg_county_list_usages.get(yearweek,{})
+        avg_county_list_usages[yearweek][feat] = np.mean(feat_usages)
+        
+    print("Average Feature Usage for all counties")
+    for yearweek in all_possible_yearweeks:
+      print(yearweek,avg_county_list_usages[yearweek])
 
+    # Capture the neighbors for each populous county by feat
     for target in populous_counties:
-      
-      # county event date for target, skip if no event
-      target_county_event, _, _ = first_covid_case.get(target,[None,None,None])
+      matched_counties[target] = {}
+      for feat in list_features:
+        # county event date for target, skip if no event
+        target_county_event, _, _ = first_covid_case.get(target,[None,None,None])
+        
+        # Get the county factors and neighbors
+        county_factors, neighbors = get_county_factors(populous_counties, static_factors, target_county=target, feat=feat)
 
-      # Get the top-k neighbors
-      county_index = list(populous_counties).index(target)
-      n_neighbors = neighbors.kneighbors([county_factors[county_index]], k_neighbors + 1, return_distance=False)
-      matched_counties[target] = []
+        # Get the top-k neighbors
+        county_index = list(populous_counties).index(target)
+        factor_to_compare = county_factors[county_index]
+        n_neighbors = neighbors.kneighbors([factor_to_compare], k_neighbors * 2, return_distance=False)
+        matched_counties[target][feat] = []
 
-      # pick the #1 closest neighbor with a greedy search
-      for i, n in enumerate(n_neighbors[0][1:]): # skip 0th entry (self)
-
-        ith_closest_county = populous_counties[n]
-
-        # Don't match with counties that have no relevant data
-        ith_closest_county_event, _, _ = first_covid_case.get(ith_closest_county,[None,None,None])
-        if ith_closest_county_event is None:
-          continue
-
-        # filter out counties with county events close by in time
-        if date_to_yearweek(target_county_event) == date_to_yearweek(ith_closest_county_event):
-          continue
-
-        # determine how much each county appears
-        if ith_closest_county not in county_representation.keys():
-          county_representation[ith_closest_county] = 0
-        county_representation[ith_closest_county] += 1
-
-        matched_counties[target].append(ith_closest_county)
+        # pick the k_neighbors closest neighbors
+        for i, n in enumerate(n_neighbors[0][1:]): # skip 0th entry (self)
+          # Stop when we have enough neighbors
+          if len(matched_counties[target][feat]) >= k_neighbors:
+            break
+          ith_closest_county = populous_counties[n]
+          # Don't match with counties that have no relevant data
+          ith_closest_county_event, _, _ = first_covid_case.get(ith_closest_county,[None,None,None])
+          if ith_closest_county_event is None:
+            continue
+          # filter out counties with county events close by in time
+          if date_to_yearweek(target_county_event) == date_to_yearweek(ith_closest_county_event):
+            continue
+          # determine how much each county appears
+          if ith_closest_county not in county_representation.keys():
+            county_representation[ith_closest_county] = 0
+          county_representation[ith_closest_county] += 1
+          matched_counties[target][feat].append(ith_closest_county)
 
     neighbor_counts = sorted(county_representation.items(), key=lambda kv: kv[1])
     print("\nCount of times each county is a neighbor\n", neighbor_counts[:10],"...",neighbor_counts[-10:], '\n')
@@ -545,7 +474,7 @@ with connection:
         matched_diffs[target] = []
         matched_befores[target] = []
         matched_afters[target] = []
-        for matched_county in matched_counties[target]:
+        for matched_county in matched_counties[target][feat]:
           matched_before, matched_after, _, _ = feat_usage_before_and_after(matched_county, feat, event_start=target_event_start, event_end=target_event_end)
           if matched_before is None or matched_after is None: 
             continue
@@ -590,7 +519,7 @@ with connection:
           print("Target After (without intervention / expected):", target_expected)
           print("Intervention Effect:                           ", intervention_effect)
           print("From {} matches, giving {} matched befores and {} matched afters".format(
-            len(matched_counties[target]), len(matched_befores[target]),len(matched_afters[target])))
+            len(matched_counties[target][feat]), len(matched_befores[target]),len(matched_afters[target])))
           print("Plotting: County {} ({}) for {}".format(feat,target,event_name))
         increase_decrease = "increased" if intervention_effect > 0 else "decreased"
         stderr_change = intervention_effect/stderr_match_after
@@ -606,6 +535,7 @@ with connection:
         _, end_after = yearweek_to_dates(max(dates_after))
         middle_before = begin_before + (end_before - begin_before)/2
         middle_after = begin_after + (end_after - begin_after)/2
+        middle_middle = middle_before + (middle_after - middle_before)/2
 
         # Calculate in-between dates and xticks
         x = [middle_before, middle_after]
@@ -627,9 +557,9 @@ with connection:
         plt.plot(x, [target_before, target_expected],'c--', label='Target (Expected)')
         matched_befores_target = matched_befores[target][:k_neighbors]
         matched_afters_target = matched_afters[target][:k_neighbors]
-        plt.plot([x[0]]*len(matched_befores_target), matched_befores_target, 'r+', alpha=0.2)
-        plt.plot([x[1]]*len(matched_afters_target), matched_afters_target, 'r+', alpha=0.2)
-        plt.plot(x,[avg_matched_befores[target],avg_matched_afters[target]],'r--',label='Average Match')
+        plt.plot([x[0]]*len(matched_befores_target), matched_befores_target, 'r+', alpha=0.5)
+        plt.plot([x[1]]*len(matched_afters_target), matched_afters_target, 'r+', alpha=0.5)
+        plt.plot(x,[avg_matched_befores[target],avg_matched_afters[target]],'r--',label='Average Match', alpha=0.4)
         plt.fill_between(x, ci_down, ci_up, color='c', alpha=0.3)
         plt.fill_between(x, ci_down_2, ci_up_2, color='c', alpha=0.2)
         plt.plot([x[1],x[1]], [target_after, target_expected], 'k-', \
@@ -637,6 +567,11 @@ with connection:
         #plt.axhline(y=avg_county_list_usages[feat], color='g', linestyle='-',label='Average {}'.format(feat))
         #plt.axhline(y=weighted_avg_county_list_usages[feat], color='g', linestyle='--',label='Weighted Average {}'.format(feat))
         plt.title("{}'s {} Before/After {}".format(fips_to_name[target], feat, event_name))
+        
+        # plot the average and weighted average per week
+        x_pos = np.arange(1,8)
+        y_vals = [avg_county_list_usages[date_to_yearweek(yw)][feat] for yw in [begin_before, end_before, middle_before, middle_middle, middle_after, begin_after, end_after]]
+        plt.plot(x_pos, y_vals, 'g-', label='Average {}'.format(feat), alpha=0.3)
 
         # Format plot
         plt.xticks(rotation=45, ha='right')
@@ -654,31 +589,6 @@ with connection:
         plt_name = "covid_plots/did_{}_{}_before_after_covid_case.png".format(target, feat)
 
         plt.savefig(plt_name) # optionally save all figures
-
-    # Aggregate Average Feature Usage
-    # all_target_befores = list(target_befores.values())
-    # all_target_diffs = list(target_diffs.values())
-    # all_target_afters = all_target_befores + all_target_diffs
-    # all_avg_matched_befores = list(avg_matched_befores.values())
-    # all_avg_matched_diffs = list(avg_matched_diffs.values())
-    # all_avg_matched_afters = list(avg_matched_afters.values()) # all_avg_matched_befores + all_avg_matched_diffs
-
-    # # Calculate befores, afters, and diffs
-    # target_before = np.mean(all_target_befores) # average of all targets before [scalar]
-    # target_diff = np.mean(all_target_diffs) # average of all target diffs [scalar]
-    # target_after = target_before + target_diff  # average of all target afters [scalar]
-
-    # avg_match_before = np.mean(all_avg_matched_befores)
-    # avg_match_diff = np.mean(all_avg_matched_diffs)
-    # avg_match_after = np.mean(all_avg_matched_afters) # avg_match_before + avg_match_diff
-
-    # target_expected = target_before + avg_match_diff  # average of all targets_before + avg_matched_diff [scalar]
-    # intervention_effect = target_after - target_expected
-    # intervention_percent = round(intervention_effect/target_expected * 100.0, 2)
-
-    # std_match_before = np.std(all_avg_matched_befores)
-    # std_match_after = np.std(all_avg_matched_afters)
-    # std_match_diff = np.std(all_avg_matched_diffs)
 
     # Print out the results in sorted order
     print("\nSorted Results for COVID Case Changes:")
