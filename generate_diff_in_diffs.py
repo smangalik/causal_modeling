@@ -505,6 +505,23 @@ with connection:
         stderr_match_before = std_matched_befores[target] / np.sqrt(matched_neighbor_count)
         stderr_match_after = std_matched_afters[target] / np.sqrt(matched_neighbor_count)
         stderr_match_diff = std_matched_diffs[target] / np.sqrt(matched_neighbor_count)
+        
+        increase_decrease = "increased" if intervention_effect > 0 else "decreased"
+        
+        stderr_change = intervention_effect/stderr_match_after
+        print("-> Change in {} {} by {}% ({} stderrs)".format(feat, increase_decrease, intervention_percent, stderr_change))
+        
+        percent_change_map[intervention_percent] = "{}:{}".format(target,feat)
+        stderr_change_map["{}:{}".format(target,feat)] = stderr_change
+        
+        # Relevant Dates
+        begin_before, _ = yearweek_to_dates(min(dates_before))
+        _, end_before = yearweek_to_dates(max(dates_before))
+        begin_after, _ = yearweek_to_dates(min(dates_after))
+        _, end_after = yearweek_to_dates(max(dates_after))
+        middle_before = begin_before + (end_before - begin_before)/2
+        middle_after = begin_after + (end_after - begin_after)/2
+        middle_middle = middle_before + (middle_after - middle_before)/2
 
         is_significant = abs(intervention_effect) > stderr_match_diff*ci_window
         if not is_significant:
@@ -520,22 +537,10 @@ with connection:
           print("Intervention Effect:                           ", intervention_effect)
           print("From {} matches, giving {} matched befores and {} matched afters".format(
             len(matched_counties[target][feat]), len(matched_befores[target]),len(matched_afters[target])))
-          print("Plotting: County {} ({}) for {}".format(feat,target,event_name))
-        increase_decrease = "increased" if intervention_effect > 0 else "decreased"
-        stderr_change = intervention_effect/stderr_match_after
-        print("-> Change in {} {} by {}% ({} stderrs)".format(feat, increase_decrease, intervention_percent, stderr_change))
+          print("Plotting: County {} ({}) for {}".format(feat,target,event_name))       
+          print(" --- ") 
 
-        percent_change_map[intervention_percent] = "{}:{}".format(target,feat)
-        stderr_change_map["{}:{}".format(target,feat)] = stderr_change
-
-        # Relevant Dates
-        begin_before, _ = yearweek_to_dates(min(dates_before))
-        _, end_before = yearweek_to_dates(max(dates_before))
-        begin_after, _ = yearweek_to_dates(min(dates_after))
-        _, end_after = yearweek_to_dates(max(dates_after))
-        middle_before = begin_before + (end_before - begin_before)/2
-        middle_after = begin_after + (end_after - begin_after)/2
-        middle_middle = middle_before + (middle_after - middle_before)/2
+        # --- Plotting ---
 
         # Calculate in-between dates and xticks
         x = [middle_before, middle_after]
@@ -547,8 +552,8 @@ with connection:
         ci_down_2 = [target_before-stderr_match_before*ci_window, target_expected-stderr_match_after*ci_window]
         ci_up_2 = [target_before+stderr_match_before*ci_window, target_expected+stderr_match_after*ci_window]
 
-        # Create Plot
-        plt.clf() # reset plot
+        # Create DiD Plot
+        plt.clf() # reset old plot
         x = [2, 6]
         xticks = [1, 3, 5, 7]
         fig, ax = plt.subplots()
@@ -568,7 +573,7 @@ with connection:
         #plt.axhline(y=weighted_avg_county_list_usages[feat], color='g', linestyle='--',label='Weighted Average {}'.format(feat))
         plt.title("{}'s {} Before/After {}".format(fips_to_name[target], feat, event_name))
         
-        # plot the average and weighted average per week
+        # Plot the average and weighted average per week
         x_pos = np.arange(1,8)
         y_vals = [avg_county_list_usages[date_to_yearweek(yw)][feat] for yw in [begin_before, end_before, middle_before, middle_middle, middle_after, begin_after, end_after]]
         plt.plot(x_pos, y_vals, 'g-', label='Average {}'.format(feat), alpha=0.3)
