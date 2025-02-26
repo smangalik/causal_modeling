@@ -1,6 +1,9 @@
 """
 load the virtual environment: `source /data/smangalik/myenvs/diff_in_diff/bin/activate`
-run as `python3.5 generate_diff_in_diffs.py` or `python3.5 generate_diff_in_diffs.py topics`
+run as `python3.5 generate_diff_in_diffs.py --covid_case`
+run as `python3.5 generate_diff_in_diffs.py --covid_death`
+run as `python3.5 generate_diff_in_diffs.py --worst_shooting`
+run as `python3.5 generate_diff_in_diffs.py --random`
 """
 
 import glob
@@ -23,21 +26,23 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 
-
 # Ignore warnings
 warnings.catch_warnings()
 warnings.simplefilter("ignore")
 
 parser = argparse.ArgumentParser(description="Process feature table for diff in diff analysis")
 parser.add_argument('--random', dest="random", default=False ,action='store_true', help='Assigns random valid events to each county')
+parser.add_argument('--covid_case', dest="covid_case", default=False ,action='store_true', help='Evaluate the first COVID-19 case per county')
+parser.add_argument('--covid_death', dest="covid_death", default=False ,action='store_true', help='Evaluate the first COVID-19 death per county')
+parser.add_argument('--worst_shooting', dest="worst_shooting", default=False ,action='store_true', help='Evaluate the worst fatal shooting per county')
 args = parser.parse_args()
 
 # is the analysis being done on topics? (topic_num needs to be interpreted)
 randomize_events = args.random
 
 # Where to load data from
-#data_file = "/data/smangalik/featANS.dd_daa_c2adpt_ans_nos.timelines19to20_lex_3upts.yw_cnty.wt50.05fc.csv" # from apollo
 data_file = "/data/smangalik/lbmha_yw_cnty.csv" # from research repo
+#data_file = "/data/smangalik/lbmha_yw_cnty_undifferenced.csv" # from research repo
 
 county_factors_table = "ctlb2.county_PESH_2020"
 county_factors_fields = "perc_republican_president_2016, perc_republican_president_2020, perc_other_president_2020, PercPop25OverBachelorDeg_census19, Log10MedianHouseholdIncome_chr20, UnemploymentRate_bls20, PercHomeowners_chr20, SocialAssociationRate_chr20, ViolentCrimeRate_chr20, PercFairOrPoorHealth_chr20, AgeAdjustedDeathRate_chr20, SuicideRateAgeAdjusted_chr20, PercDisconnectedYouth_chr20"
@@ -46,21 +51,30 @@ county_factors_fields = "perc_republican_president_2016, perc_republican_preside
 pca_components = 3
 
 # How many of the top populous counties we want to keep
-top_county_count = 500 # 3232 is the maximum number, has a serious effect on results
+top_county_count = 1000 # 3232 is the maximum number, has a serious effect on results, usually use 1000
 
 # Number of nearest neighbors
 k_neighbors = 10
 
 # Diff in Diff Windows
 default_before_start_window = 1 # additional weeks to consider before event startf
-default_after_end_window = 1 # additional weeks to consider after event end
-default_event_buffer = 1 # number of weeks to ignore before and after event
+default_after_end_window = 1    # additional weeks to consider after event end
+default_event_buffer = 1        # number of weeks to ignore before and after event
 
 # Confidence Interval Multiplier
 ci_window = 1.96
 
 # Scale factor for y-axis
 scale_factor = 100000
+
+# County-wise Socioeconomic Status
+print("Loading SES Data...")
+ses = pd.read_excel("/users2/smangalik/causal_modeling/LBMHA_Tract.xlsx")
+ses['fips'] = ses['cfips'].astype(str).str.zfill(5)
+ses = ses.groupby('fips').mean().reset_index()
+ses = ses.dropna(subset=['fips','ses3'])
+ses['ses3'] = ses['ses3'].astype(int)
+print(ses[['fips','ses3']])
 
 # event_date_dict[county] = [event_start (datetime, exclusive), [optional] event_end (datetime, inclusive), event_name]
 county_events = {}
@@ -80,8 +94,33 @@ with open("/data/smangalik/countyFirsts.csv") as countyFirsts:
       if firstDeath != "":
         first_covid_death[fips] = [datetime.datetime.strptime(firstDeath, '%Y-%m-%d'),None,"First Covid Death"]
         
-county_events = first_covid_death
+# Load shooting events
+shootings_df = pd.read_csv("/data/smangalik/causal_modeling/mass_shootings_with_fips.csv")
+shootings_df['date'] = pd.to_datetime(shootings_df['Incident Date'])
+shootings_df = shootings_df[shootings_df['date'].dt.year == 2020] # only keep shootings in 2020
+shootings_df['fips'] = shootings_df['fips'].astype(str).str.zfill(5)
+shootings_df['victims'] = shootings_df['Victims Killed'] + shootings_df['Victims Injured']
+shootings_df['suspects'] = shootings_df['Suspects Killed'] + shootings_df['Suspects Injured']
+# only keep the worst shooting for each county
+shootings_df = shootings_df.sort_values('Victims Killed',ascending=False).drop_duplicates(subset='fips',keep='first').sort_index()
+worst_shooting = {}
+for i, row in shootings_df.iterrows():
+  fips = row['fips']
+  date = row['date']
+  worst_shooting[fips] = [date, None, "Worst Shooting"]
+
         
+# Pick the events to use
+if args.covid_case:
+  county_events = first_covid_case
+elif args.covid_death:
+  county_events = first_covid_death
+elif args.worst_shooting:
+  county_events = worst_shooting
+else:
+  print("NOT EVENT TYPE CHOSEN, using first covid case")
+  county_events = first_covid_case
+
 if randomize_events:
   # get unique event dates from the events
   possible_event_dates = list(set([event_start for event_start, _, _ in county_events.values()]))
@@ -206,17 +245,23 @@ def get_county_factors(populous_counties, static_factors, target_county='36103',
     # Write to target_factors
     target_factors[i,] = np.asarray([county_adjacent,feat_score_before_event,feat_score_before_event,feat_score_before_event], dtype=np.float32)
     
-  # replace NaNs with column means
-  for i in range(target_factors.shape[1]):
-    col = target_factors[:,i]
-    mean = np.nanmean(col)
-    col[np.isnan(col)] = mean  
-    
   # Combine static and target factors
   county_factors = np.concatenate((static_factors,target_factors),axis=1)
+  
+  # replace invalid entries with column means
+  for i in range(county_factors.shape[1]):
+    col = county_factors[:,i]
+    mean = np.nanmean(col)
+    col[np.isnan(col)] = mean
+    col[np.isinf(col)] = mean 
+    largest_float = np.finfo(np.float32).max
+    col[col >= largest_float] = mean
 
   # Fit the nearest neighbors
-  neighbors.fit(county_factors)
+  try:
+    neighbors.fit(county_factors)
+  except ValueError as _:
+    return None, None
 
   return county_factors, neighbors
 
@@ -329,14 +374,14 @@ with connection:
     # Load data from CSV
     df = pd.read_csv(data_file)
     df['cnty'] = df['cnty'].astype(str).str.zfill(5)
-    df['feat'] = df['score_category'].str.replace('DEP_SCORE','Depression').replace('ANX_SCORE','Anxiety')
+    df['feat'] = df['score_category'].str.replace('DEP_SCORE','Depression').replace('ANX_SCORE','Anxiety').replace('WEC_sadF','Sad').replace('WEB_worryF','Worry')
     score_col = 'score'
 
     # Require n_users >= 200
     df = df[df['n_users'] >= 200]
-    
+
     print("Data from CSV:", data_file)
-    print(df)
+    print(df.head(10))
     print("Columns:",df.columns.tolist())
 
     list_features = df['feat'].unique()
@@ -408,8 +453,16 @@ with connection:
         # county event date for target, skip if no event
         target_county_event, _, _ = county_events.get(target,[None,None,None])
         
+        if target_county_event is None:
+          #print("Skipping",target,"for",feat, 'due to missing event')
+          continue
+        
         # Get the county factors and neighbors
         county_factors, neighbors = get_county_factors(populous_counties, static_factors, target_county=target, feat=feat)
+        
+        if county_factors is None:
+          print("Skipping",target,"for",feat, 'due to missing neighbors')
+          continue
 
         # Get the top-k neighbors
         county_index = list(populous_counties).index(target)
@@ -466,8 +519,10 @@ with connection:
     for f in files:
       os.remove(f)
     
-    print("\nCalculating Diff in Diffs for",len(populous_counties),"counties")
-    for target in tqdm(populous_counties):
+    target_counties = set(populous_counties)
+    
+    print("\nCalculating Diff in Diffs for",len(target_counties),"counties")
+    for target in tqdm(target_counties):
       
       # Event for each county
       blank_event = [None,None,None]
@@ -475,7 +530,7 @@ with connection:
 
       # If no event was found for this county, skip
       if target_event_start is None and target_event_end is None:
-        print("Skipping {} ({}) due to missing event".format(target,fips_to_name.get(target)))
+        #print("Skipping {} ({}) due to missing event".format(target,fips_to_name.get(target)))
         continue # no event was found for this county
       
       #print()
@@ -624,8 +679,8 @@ with connection:
         
         # Plot the average and weighted average per week
         y_vals = [
-          np.mean([ avg_county_list_usages[yw][feat] for yw in dates_before ]),
-          np.mean([ avg_county_list_usages[yw][feat] for yw in dates_after]),
+          np.mean([ avg_county_list_usages[yw][feat] for yw in dates_before if yw in avg_county_list_usages ]),
+          np.mean([ avg_county_list_usages[yw][feat] for yw in dates_after if yw in avg_county_list_usages ]),
         ]
         ax2.plot(x, y_vals, 'g--', label='Average Overall', alpha=0.8)
 
@@ -644,8 +699,8 @@ with connection:
         # y_vals = np.nanmean(y_vals,axis=0)
         #ax2.plot(x_pos, y_vals, 'r-', label='Matched {}'.format(feat), alpha=0.3)
 
-        ymin = min([min(y_vals),min(matched_befores_target),min(matched_afters_target),avg_matched_befores[target],avg_matched_afters[target], target_before, target_after, target_expected])
-        ymax = max([max(y_vals),max(matched_befores_target),max(matched_afters_target),avg_matched_befores[target],avg_matched_afters[target], target_before, target_after, target_expected])
+        ymin = min([min(y_vals),min(matched_befores_target),min(matched_afters_target),avg_matched_befores[target],avg_matched_afters[target], target_before, target_after, target_expected, min(ci_down_2)])
+        ymax = max([max(y_vals),max(matched_befores_target),max(matched_afters_target),avg_matched_befores[target],avg_matched_afters[target], target_before, target_after, target_expected,max(ci_up_2)])
 
         # Format plot
         plt.ylabel("Change in {}".format(feat))
@@ -680,17 +735,47 @@ with connection:
     print("-> Overall average diff was {} stddev's larger than the counterfactual diff".format(np.mean(all_diffs)))
     
     # Create a pandas dataframe
-    print("\nCreating Pandas Dataframe")
+    print("\nCreating Pandas Dataframe of Outcomes")
     columns = ['fips','feat','event_name','event_date','event_date_centered','target_before','target_diff_actual','target_diff_expected','intervention_effect','intervention_percent','neighbor_count','matched_diff_avg','matched_diff_std','change_in_stddevs','significant']
     output = pd.DataFrame(output_dicts)[columns]
     print(output.sort_values(by=['fips','feat']))
-    outcomes  = ['intervention_effect','change_in_stddevs','intervention_percent','neighbor_count']
+    
+    # Merge the SES data
+    output = output.merge(ses, how='left', on='fips')
+    output_ses_1 = output[output['ses3'] == 1]
+    output_ses_2 = output[output['ses3'] == 2]
+    output_ses_3 = output[output['ses3'] == 3]
+    
+    def print_outputs(output_df):
+      output_df = output_df.copy(deep=True)
+      outcomes  = ['intervention_effect','change_in_stddevs','intervention_percent','neighbor_count']
+      for feat in list_features:
+        print("\nMean findings for",feat)
+        outcomes_feat = output_df[output_df['feat'] == feat]
+        for outcome in outcomes:
+          dat = outcomes_feat[outcome].replace([np.inf, -np.inf], np.nan).dropna()
+          print("-> Mean (stderr) {} = {} ({})".format( outcome, round(np.mean(dat),4), round(np.std(dat)/np.sqrt(len(dat)),4) ))
+    
+    print("\nResults for all SES levels --------- ", output.shape)
+    print_outputs(output)
+    print("\nResults for SES Level 1 --------- ", output_ses_1.shape)
+    print_outputs(output_ses_1)
+    print("\nResults for SES Level 2 --------- ", output_ses_2.shape)
+    print_outputs(output_ses_2)
+    print("\nResults for SES Level 3 --------- ", output_ses_3.shape)
+    print_outputs(output_ses_3)
+    
+    # Correlation between SES and Intervention Effect
+    print("\nCorrelation between SES and outcomes")
+    corr_columns = ['pblack','pfem','p65old','phisp','unemployment_rate_2018','ses','svar','lnurban','ses3']
     for feat in list_features:
-      print("\nMean findings for",feat)
+      print("\nCorrelation for",feat)
       outcomes_feat = output[output['feat'] == feat]
-      for outcome in outcomes:
-        dat = outcomes_feat[outcome].replace([np.inf, -np.inf], np.nan).dropna()
-        print("-> Mean (std) {} = {} ({})".format(outcome, np.mean(dat), np.std(dat)))
+      outcome = 'intervention_effect'
+      dat = outcomes_feat[outcome].replace([np.inf, -np.inf], np.nan).dropna()
+      for col in corr_columns:
+        corr = np.corrcoef(dat,output[col].loc[dat.index])[0,1]
+        print("-> Correlation between {} and {} = {}".format(outcome,col,round(corr,4)))
     
     # Plot amount change over time if not doing a randomization
     if not randomize_events:
