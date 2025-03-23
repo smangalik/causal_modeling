@@ -6,6 +6,9 @@ run as `python3.5 generate_rdds.py --worst_shooting`
 run as `python3.5 generate_rdds.py --random`
 """
 
+import matplotlib
+matplotlib.use('Agg') 
+
 import glob
 import os
 import sys  # noqa: F401
@@ -18,10 +21,12 @@ import warnings
 import argparse
 from tqdm import tqdm
 import datetime
-
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+
+# Set numpy random seed
+np.random.seed(0)
 
 # Ignore warnings
 warnings.catch_warnings()
@@ -42,7 +47,7 @@ data_file = "/data/smangalik/lbmha_yw_cnty.csv" # from research repo
 #data_file = "/data/smangalik/lbmha_yw_cnty_undifferenced.csv" # from research repo
 
 # How many of the top populous counties we want to keep
-top_county_count = 100 # 3232 is the maximum number, has a serious effect on results, usually use 1000
+top_county_count = 4000 # Default to 4000, max is 3142
 
 # user threshold (ut) required to consider a county
 ut = 200 
@@ -50,19 +55,20 @@ ut = 200
 # RDD Windows
 default_before_start_window = 9 # additional weeks to consider before event start
 default_after_end_window = 9    # additional weeks to consider after event end
-default_event_buffer = 0        # number of weeks to ignore before and after event
+event_buffer = 2                # number of weeks to ignore before and after event
 
 # Confidence Interval Multiplier
 ci_window = 1.96
 
 # County-wise Socioeconomic Status
-print("Loading SES Data...")
-ses = pd.read_excel("/users2/smangalik/causal_modeling/LBMHA_Tract.xlsx")
+print("\nLoading SES Data...")
+ses = pd.read_csv("/users2/smangalik/causal_modeling/LBMHA_Tract.csv")
 ses['fips'] = ses['cfips'].astype(str).str.zfill(5)
 ses = ses.groupby('fips').mean().reset_index()
 ses = ses.dropna(subset=['fips','ses3'])
 ses['ses3'] = ses['ses3'].astype(int)
-print(ses[['fips','ses3']])
+print(ses.head(10))
+county_to_ses = dict(zip(ses['fips'],ses['ses3']))
 
 # event_date_dict[county] = [event_start (datetime, exclusive), [optional] event_end (datetime, inclusive), event_name]
 county_events = {}
@@ -96,21 +102,31 @@ for i, row in shootings_df.iterrows():
   fips = row['fips']
   date = row['date']
   worst_shooting[fips] = [date, None, "Worst Shooting"]
-
+  
+# Control events, randomly drawn from uniform distribution
+control_events = {}
+for fips in fips_to_population.keys():
+  # select a random datetime.datetime in the year 2020
+  random_date = datetime.datetime(2020, 1, 1) + datetime.timedelta(days=np.random.randint(0, 366))
+  control_events[fips] = (random_date, None, "Control Event")
         
 # Pick the events to use
 if args.covid_case:
   print("Using First Covid Case Events")
   county_events = first_covid_case
+  event_name = "First Covid Case"
 elif args.covid_death:
   print("Using First Covid Death Events")
   county_events = first_covid_death
+  event_name = "First Covid Death"
 elif args.worst_shooting:
   print("Using Worst Shooting Events")
   county_events = worst_shooting
+  event_name = "Worst Shooting"
 else:
-  print("NO EVENT CHOSEN, defaulting to first covid case")
-  county_events = first_covid_case
+  print("NO EVENT CHOSEN, defaulting to control events")
+  county_events = control_events
+  event_name = "Control Event"
 
 if randomize_events:
   # get unique event dates from the events
@@ -119,9 +135,6 @@ if randomize_events:
   import random
   for fips in county_events.keys():
     county_events[fips] = [random.choice(possible_event_dates),None,"Random Event"]
-  print("Random Events: First Event for 40143",county_events.get('40143'))
-else:
-  print("Using Real Events: First Event for 40143",county_events.get('40143'))
 
 print('Connecting to MySQL...')
 
@@ -164,9 +177,12 @@ def yearweek_to_dates(yw:str) -> Tuple[datetime.date, datetime.date]:
 def feat_usage_from_dates(county,dates,feat='Depression') -> float:
   feat_usages = []
   for date in sorted(dates):
-    if county_feats.get(county,None) is not None:
-      if county_feats[county].get(date,None) is not None: 
-        if county_feats[county][date].get(feat,None) is not None:
+    county_feats_county = county_feats.get(county,None)
+    if county_feats_county is not None:
+      county_feats_date = county_feats_county.get(date,None)
+      if county_feats_date is not None: 
+        county_feats_feat = county_feats_date.get(feat,None)
+        if county_feats_feat is not None:
           feats_for_date = np.array(county_feats[county][date][feat])
           feat_usages.append(feats_for_date)
         else:
@@ -177,22 +193,23 @@ def feat_usage_from_dates(county,dates,feat='Depression') -> float:
         feat_usages.append(np.nan)
     else:
       #print("No county",county)
-      feat_usages.append(np.nan)
+      return [np.nan] * len(dates)
       
   return feat_usages
 
 def regression_feat_usage_from_dates(county,dates,feat='Depression') -> float:
   # Get the feature usage for the county on the dates
   feat_usages = feat_usage_from_dates(county,dates,feat)
+  
+  # If all X is NaN, return NaN
+  if all(np.isnan(feat_usages)):
+    return np.nan, np.nan
 
   # Report the slope and intercept of the date and feat usage
   feat_usages = np.array(feat_usages)
   mask = ~np.isnan(feat_usages) # drop NaNs
-  X = np.arange(len(feat_usages))[mask].reshape(-1,1)
+  X = np.arange(len(feat_usages))[mask].reshape(-1, 1)
   y = feat_usages[mask]
-  
-  if len(X) == 0:
-    return np.nan, np.nan
   
   regression = LinearRegression().fit(X, y)
   return regression.coef_[0], regression.intercept_
@@ -201,7 +218,7 @@ def regression_feat_usage_from_dates(county,dates,feat='Depression') -> float:
 def regression_usage_before_and_after(county, feat, event_start, event_end=None,
                                  before_start_window=default_before_start_window,
                                  after_start_window=default_after_end_window,
-                                 event_buffer=default_event_buffer) -> Tuple[ Tuple[float,float], Tuple[float,float], List[str], List[str] ]:
+                                 event_buffer=0) -> Tuple[ Tuple[float,float], Tuple[float,float], List[str], List[str] ]:
   '''
   Returns the average feature usage for a county before and after an event
   @param county: the county to examine
@@ -275,8 +292,9 @@ with connection:
 
     list_features = df['feat'].unique()
     
-    # Normalize wavg_score to be between 0 and 1 per county feature
-    df[score_col] = df.groupby(['cnty','feat'])[score_col].transform(lambda x: (x - x.min()) / (x.max() - x.min()))
+    # Normalize feat scores per county feature
+    #df[score_col] = df.groupby(['cnty','feat'])[score_col].transform(lambda x: (x - x.min()) / (x.max() - x.min())) # Min Max Scale
+    df[score_col] = df.groupby(['cnty','feat'])[score_col].transform(lambda x: (x - x.mean()) / x.std()) # Z-Score 
     
     print("Loading Unique Features:",list_features)
     county_feats = defaultdict(lambda: defaultdict(dict))
@@ -284,50 +302,36 @@ with connection:
     for (feat, county, yearweek), group in tqdm(grouped):
         county_feats[county][yearweek][feat] = group[score_col].iloc[0]
     county_feats = {k: dict(v) for k, v in county_feats.items()} # Convert to a regular dict
-    
-    print("county_feats['40143']['2020_07']['Depression'] =",county_feats['40143']['2020_07']['Depression'])
-    print("county_feats['40143']['2020_08']['Depression'] =",county_feats['40143']['2020_08']['Depression'])
-    print("county_feats['40143']['2020_20']['Anxiety'] =",county_feats['40143']['2020_20']['Anxiety'])
-    available_yws = list(county_feats['40143'].keys())
-    available_yws.sort()
-    print("\nAvailable weeks for 40143:",  available_yws)
-    
-    # Display nearest neighbors for first county
-    #test_county = '36103' # Suffolk, NY
-    test_county = '40143' # Washington, DC
-    test_county_index = list(populous_counties).index(test_county)
 
     # Calculate Average and Weighted Average Weekly Feat Score for Baselines
-    county_list = county_feats.keys() # all counties considered in orde
     avg_county_list_usages = {} # avg_county_list_usages[yearweek][feat] = average value
     all_possible_yearweeks = sorted(df['yearweek'].unique().tolist())
     for yearweek in all_possible_yearweeks:
       for feat in list_features:
         feat_usages = []
-        for county in county_list:
-          if county_feats.get(county,None) is not None:
-            if county_feats[county].get(yearweek,None) is not None: 
-              if county_feats[county][yearweek].get(feat,None) is not None:
-                feats_for_date = np.array(county_feats[county][yearweek][feat])
+        for county in set(populous_counties):
+          if county_feats.get(county):
+            if county_feats[county].get(yearweek): 
+              if county_feats[county][yearweek].get(feat):
+                feats_for_date = county_feats[county][yearweek][feat]
                 feat_usages.append(feats_for_date)
-        if len(feat_usages) == 0:
+        if not feat_usages:
           # print("No matching dates for", county, "on dates", dates)
           continue
         avg_county_list_usages[yearweek] = avg_county_list_usages.get(yearweek,{})
-        avg_county_list_usages[yearweek][feat] = np.nanmean(feat_usages)
+        avg_county_list_usages[yearweek][feat] = round( np.nanmean(feat_usages), 5)
+        avg_county_list_usages[yearweek][feat+'_unique'] = round( len(set(feat_usages)), 5)
+        avg_county_list_usages[yearweek][feat+'_std'] = round( np.nanstd(feat_usages), 5)
         
-    print("\nAverage Feature Usage for all counties")
+    num_counties_studied = len(set(populous_counties).intersection(set(county_feats.keys())))
+    print("\nAverage Feature Usage for", num_counties_studied, "studied counties")
     for yearweek in all_possible_yearweeks:
       print(yearweek,avg_county_list_usages[yearweek])
-
-
+  
     # Calculate RDDs dict[county] = value
     target_befores = {}
     target_afters = {}
     target_diffs = {}
-    
-    percent_change_map = {}
-    amount_change_map = {}
 
     output_dicts = []
 
@@ -338,20 +342,49 @@ with connection:
       os.remove(f)
     
     target_counties = set(populous_counties)
+    missing_counties = set()
+    
+    # All outcomes
+    x_before_all = {feat:[] for feat in list_features}
+    y_before_all = {feat:[] for feat in list_features}
+    x_after_all = {feat:[] for feat in list_features}
+    y_after_all = {feat:[] for feat in list_features}
+    x_all = {feat:[] for feat in list_features}
+    y_all = {feat:[] for feat in list_features}
+    
+    # Spaghetti outcomes
+    x_before_spaghetti = {feat:[] for feat in list_features}
+    y_before_spaghetti = {feat:[] for feat in list_features}
+    x_after_spaghetti = {feat:[] for feat in list_features}
+    y_after_spaghetti = {feat:[] for feat in list_features}
+    x_spaghetti = {feat:[] for feat in list_features}
+    y_spaghetti = {feat:[] for feat in list_features}
+    
+    # SES outcomes
+    x_before_ses = {feat:{1:[], 2:[], 3:[]} for feat in list_features}
+    y_before_ses = {feat:{1:[], 2:[], 3:[]} for feat in list_features}
+    x_after_ses = {feat:{1:[], 2:[], 3:[]} for feat in list_features}
+    y_after_ses = {feat:{1:[], 2:[], 3:[]} for feat in list_features}
+    x_ses = {feat:{1:[], 2:[], 3:[]} for feat in list_features}
+    y_ses = {feat:{1:[], 2:[], 3:[]} for feat in list_features}
+    
     
     print("\nCalculating RDDs for",len(target_counties),"counties")
     for target in tqdm(target_counties):
       
+      if target not in county_feats:
+        continue # no data for this county
+      
       # Event for each county
       blank_event = [None,None,None]
-      target_event_start, target_event_end, event_name = county_events.get(target,blank_event)
+      target_event_start, target_event_end, _ = county_events.get(target,blank_event)
 
       # If no event was found for this county, skip
       if target_event_start is None and target_event_end is None:
         #print("Skipping {} ({}) due to missing event".format(target,fips_to_name.get(target)))
+        missing_counties.add(target)
         continue # no event was found for this county
       
-      #print()
       for feat in list_features: # run RDD against each feature
         
         (target_before_slope,target_before_intercept), (target_after_slope,target_after_intercept), dates_before, dates_after = regression_usage_before_and_after(target, feat, event_start=target_event_start, event_end=target_event_end)
@@ -374,14 +407,13 @@ with connection:
         target_afters[target] = target_after
         target_diffs[target] = target_diff
         
-        # RDD Calculation # TODO how are these calculated?
-        intervention_effect = target_diff[1]
-        intervention_percent = round(intervention_effect/target_before_intercept * 100.0, 2)
-        is_significant = True # TODO: implement significance test
+        # RDD Calculation
+        slope_effect, intercept_effect = target_diff
+        is_significant = abs(intercept_effect) >= 0.2
 
         # print("County: {} ({}) studying {} against {}".format(target, fips_to_name.get(target), feat, event_name))
         
-        increase_decrease = "increased" if intervention_effect > 0 else "decreased"
+        increase_decrease = "increased" if intercept_effect > 0 else "decreased"
         
         # Relevant Dates
         begin_before, _ = yearweek_to_dates(min(dates_before))
@@ -391,11 +423,6 @@ with connection:
         middle_before = begin_before + (end_before - begin_before)/2
         middle_after = begin_after + (end_after - begin_after)/2
         middle_middle = middle_before + (middle_after - middle_before)/2
-        
-        # Write findings to maps
-        map_key = "{}:{}:{}".format(target,feat,middle_middle)
-        percent_change_map[intervention_percent] = map_key
-        amount_change_map[intervention_effect] = [target,feat,middle_middle]
 
         # For writing to a dataframe
         pandas_entry = {
@@ -411,54 +438,82 @@ with connection:
           "target_after_intercept": target_after[1], # feat score after the event
           "target_diff_slope": target_diff[0], # feat score after - feat score before
           "target_diff_intercept": target_diff[1], # feat score after - feat score before
-          "intervention_effect": intervention_effect, # feat score after - target_diff_expected
-          "intervention_percent": intervention_percent, # intervention_effect / target_expected * 100
+          "slope_effect": slope_effect,
+          "intercept_effect": intercept_effect, 
+          "ses": county_to_ses.get(target), # Socioeconomic Status of the county
         }
-        output_dicts.append(pandas_entry)
+        output_dicts.append(pandas_entry)     
+        
+        if randomize_events:
+          continue # skip plotting for randomized events
 
+        # --- Calculate Before and After Values ---
+
+        # Calculate in-between dates and xticks
+        x_center = len(dates_before)
+        x = np.array(range(1, x_center + len(dates_after)))
+        xticklabels = [
+            x_i - x_center for x_i in x
+          ]
+        xticklabels[x_center-1] = target_event_start.strftime('%Y-%m-%d')
+        x_before = np.array(x[:x_center])
+        x_after = np.array(x[x_center-1:])
+        
+        # Drop NaNs
+        # y_before = [ avg_county_list_usages[yw][feat] if yw in avg_county_list_usages else np.nan for yw in dates_before ]
+        # y_after =  [ avg_county_list_usages[yw][feat] if yw in avg_county_list_usages else np.nan for yw in dates_after ]
+        y_before = [ county_feats[target][yw][feat] if yw in county_feats[target].keys() else np.nan for yw in dates_before ]
+        y_after =  [ county_feats[target][yw][feat] if yw in county_feats[target].keys() else np.nan for yw in dates_after ]
+        y_vals = np.array(y_before + y_after[1:]) # skip the first repeat date in "after"
+        y_before = np.array(y_before)
+        y_after = np.array(y_after)
+        
+        # Store all y_vals for mega-plot
+        x_before_all[feat].extend(x_before.tolist())
+        x_after_all[feat].extend(x_after.tolist())
+        x_all[feat] += list(np.concatenate([x_before,x_after[1:]]))
+        y_before_all[feat].extend(y_before.tolist())
+        y_after_all[feat].extend(y_after.tolist())
+        y_all[feat] += list(np.concatenate([y_before,y_after[1:]]))
+        
+        # Store all vals for spaghetti-plot
+        x_before_spaghetti[feat].append(x_before.tolist())
+        x_after_spaghetti[feat].append(x_after.tolist())
+        x_spaghetti[feat].append(list(np.concatenate([x_before,x_after[1:]])))
+        y_before_spaghetti[feat].append(y_before.tolist())
+        y_after_spaghetti[feat].append(y_after.tolist())
+        y_spaghetti[feat].append(list(np.concatenate([y_before,y_after[1:]])))
+        
+        # Store all vals for SES-plot
+        x_before_ses[feat][county_to_ses[target]].append(x_before.tolist())
+        x_after_ses[feat][county_to_ses[target]].append(x_after.tolist())
+        x_ses[feat][county_to_ses[target]].append(list(np.concatenate([x_before,x_after[1:]])))
+        y_before_ses[feat][county_to_ses[target]].append(y_before.tolist())
+        y_after_ses[feat][county_to_ses[target]].append(y_after.tolist())
+        y_ses[feat][county_to_ses[target]].append(list(np.concatenate([y_before,y_after[1:]])))
+        
         # Only plot significant results
         if not is_significant:
-          # print("NOT significant: County {} ({}) for {}, {} was not greater than {}\n --- ".format(
-          #   feat,target,event_name,abs(intervention_effect),stddev_match_diff*ci_window)
-          # )
           continue # only plot significant results
         else:
           # print("Target Before:                                 ", target_before)
           # print("Target After (with intervention / observation):", target_after)
           # print("Target After (without intervention / expected):", target_expected)
-          # print("Intervention Effect:                           ", intervention_effect)
+          # print("Intercept Effect:                           ", intercept_effect)
           # print("From {} matches, giving {} matched befores and {} matched afters".format(
           #   len(matched_counties[target][feat]), len(matched_befores[target]),len(matched_afters[target])))
           # print("Plotting: County {} ({}) for {}\n --- ".format(feat,target,event_name))  
-          pass     
+          pass        
         
-        if randomize_events:
-          continue # skip plotting for randomized events
-
         # --- Plotting ---
 
-        # Calculate in-between dates and xticks
-        x = np.array(range(1, len(dates_before) + len(dates_after)))
-        xticklabels = [
-            x_i - len(dates_before) for x_i in x
-          ]
-        xticklabels[len(dates_before)-1] = target_event_start.strftime('%Y-%m-%d')
-        x_before = np.array(x[:len(dates_before)])
-        x_after = np.array(x[len(dates_before)-1:])
-        
-        y_before = [ avg_county_list_usages[yw][feat] if yw in avg_county_list_usages else np.nan for yw in dates_before ]
-        y_after =  [ avg_county_list_usages[yw][feat] if yw in avg_county_list_usages else np.nan for yw in dates_after ]
-        y_vals = np.array(y_before + y_after[1:]) # skip the first repeat date in "after"
-        y_before = np.array(y_before)
-        y_after = np.array(y_after)
-
-        # Create DiD Plot
+        # Create RDD Plot
         plt.clf() # reset old plot
         fig, (ax1, ax2) = plt.subplots(nrows=1, ncols=2) # Horizontally stacked plots
-        fig.set_size_inches(10, 6)
-        ax1.scatter(x[:len(dates_before)-1], y_vals[:len(dates_before)-1], label='Target (Before)')
-        ax1.scatter(x[len(dates_before)-1], y_vals[len(dates_before)-1], color='black',label='Target (During)')
-        ax1.scatter(x[len(dates_before):], y_vals[len(dates_before):], label='Target (After)')
+        fig.set_size_inches(20, 6)
+        ax1.scatter(x[:x_center-1], y_vals[:x_center-1], label='Target (Before)')
+        ax1.scatter(x[x_center-1], y_vals[x_center-1], color='black',label='Target (During)')
+        ax1.scatter(x[x_center:], y_vals[x_center:], label='Target (After)')
         
         # print('x_before',x_before)
         # print('y_before',y_before)
@@ -466,8 +521,8 @@ with connection:
         # print('y_after',y_after)        
         
         # Plot vertical line for event
-        ax1.axvline(x=len(dates_before), color='black', linestyle='--', label='Event')
-        ax2.axvline(x=len(dates_before), color='black', linestyle='--', label='Event')
+        ax1.axvline(x=x_center, color='black', linestyle='--', label='Event')
+        ax2.axvline(x=x_center, color='black', linestyle='--', label='Event')
         
         # Plot line of best fit for Target (Before)
         mask = ~np.isnan(y_before)
@@ -487,38 +542,25 @@ with connection:
         
         # Set x label for ax1
         ax1.set_xlabel("Weeks Before and After Event")
+        ax2.set_xlabel("Weeks Before and After Event")
         
-        #plt.axhline(y=avg_county_list_usages[feat], color='g', linestyle='-',label='Average {}'.format(feat))
-        #plt.axhline(y=weighted_avg_county_list_usages[feat], color='g', linestyle='--',label='Weighted Average {}'.format(feat))
-        fig.suptitle('Intervention Effect (Slope: {} Intercept: {})'.format(round(target_diff[0],3), round(target_diff[1],3)))
+        fig.suptitle('Effect of {} on {} (Slope: {} Intercept: {})'.format(
+          event_name, fips_to_name.get(target), round(target_diff[0],3), round(target_diff[1],3))
+        )
         
         # Plot the average and weighted average per week
         
         ax2.scatter(x, y_vals, color='green', label='All', alpha=0.8)
 
-        # Plot the target county per week
-        # x_pos = np.arange(1,8)
-        # y_pos = [begin_before, end_before, middle_before, middle_middle, middle_after, begin_after, end_after]
-        # x_pos = np.arange(1,8)
-        # y_vals = [county_feats.get(target,{}).get(date_to_yearweek(yw),{}).get(feat,np.nan) for yw in y_pos]
-        #ax2.plot(x_pos, y_vals, 'b-', label='Target {}'.format(feat), alpha=0.3)
-
-        # Plot the matched counties per week
-        # x_pos = np.arange(1,8)
-        # y_vals = np.zeros((len(matched_counties[target][feat]),len(y_pos)))
-        # for i, matched_county in enumerate(matched_counties[target][feat]):
-        #   y_vals[i] = [county_feats.get(matched_county,{}).get(date_to_yearweek(yw),{}).get(feat,np.nan) for yw in y_pos]
-        # y_vals = np.nanmean(y_vals,axis=0)
-        #ax2.plot(x_pos, y_vals, 'r-', label='Matched {}'.format(feat), alpha=0.3)
 
         ymin = min([min([y for y in y_vals if y is not None])])
         ymax = max([max([y for y in y_vals if y is not None])])
 
         # Format plot
-        plt.ylabel("County {} Score".format(feat))
+        plt.ylabel("County {} Z-Score".format(feat))
         for ax in [ax1, ax2]:
           ax.set_xticks(x)
-          ax.set_xticklabels(xticklabels, rotation=80)
+          ax.set_xticklabels(xticklabels, rotation=0)
           ax.axis(ymin=ymin, ymax=ymax)
           ax.legend()
         fig.tight_layout(rect=[0, 0.03, 1, 0.95])
@@ -527,21 +569,239 @@ with connection:
 
         plt.savefig(plt_name) # optionally save all figures
         
-    # Print out the results in sorted order
-    print("\nSorted Results for Event Changes:")
-    for percent_change in sorted(percent_change_map.keys()):
-      feature = percent_change_map[percent_change]
-    print("\nSummary for Event Change:")
+    print("\n",len(missing_counties),"counties with no {} dates:\n".format(event_name),missing_counties)
+        
+    # Create a mega-plot of all befores and afters     
     for feat in list_features:
-      feat_diffs = [key for key,value in percent_change_map.items() if value.split(":")[1] == feat]
-      print("-> {} average diff was {} stddev's larger than the counterfactual diff".format(feat, np.mean(feat_diffs)))
-    all_diffs = list(percent_change_map.keys())
-    print("-> Overall average diff was {} stddev's larger than the counterfactual diff".format(np.mean(all_diffs)))
+      print("\nCreating Mega-Plot for",feat)
+      x_before_all_feat = np.array(x_before_all[feat])
+      y_before_all_feat = np.array(y_before_all[feat])
+      x_after_all_feat = np.array(x_after_all[feat])
+      y_after_all_feat = np.array(y_after_all[feat])
+      x_during_all_feat = np.array(x_all[feat])
+      y_during_all_feat = np.array(y_all[feat])
+      x_all_feat = np.array(x_all[feat])
+      y_all_feat = np.array(y_all[feat])
+      plt.clf() # reset old plot
+      x = np.array(range(1, x_center + len(dates_after)))
+      xticklabels = [x_i - x_center for x_i in x]
+      xticklabels[x_center-1] = ""
+      circle_size = 100
+      circle_alpha = 0.3
+      line_alpha = 0.5
+      fig, (ax1, ax2) = plt.subplots(nrows=1, ncols=2) # Horizontally stacked plots
+      fig.set_size_inches(20, 6)
+      ax1.scatter(x_before_all_feat, y_before_all_feat, label='Target (Before)', edgecolor='red', facecolors='none', alpha=circle_alpha)
+      ax1.scatter(x_after_all_feat, y_after_all_feat, label='Target (After)', edgecolor='blue', facecolors='none', alpha=circle_alpha)
+      # Plot vertical line for event
+      ax1.axvline(x=x_center, color='black', linestyle='--', label='Event')
+      ax2.axvline(x=x_center, color='black', linestyle='--', label='Event')
+      # Plot line of best fit for Target (Before)
+      mask = ~np.isnan(y_before_all_feat)
+      regression_before = LinearRegression().fit( x_before_all_feat[mask].reshape(-1, 1), y_before_all_feat[mask] )
+      ax1.plot(x_before_all_feat, regression_before.predict(x_before_all_feat.reshape(-1, 1)), color='red', linestyle='--', alpha=line_alpha, label='Target (Before) Fit')
+      # Plot line of best fit for Target (After)
+      mask = ~np.isnan(y_after_all_feat)
+      regression_after = LinearRegression().fit( x_after_all_feat[mask].reshape(-1, 1), y_after_all_feat[mask] )
+      ax1.plot(x_after_all_feat, regression_after.predict(x_after_all_feat.reshape(-1, 1)), color='blue', linestyle='--', alpha=line_alpha, label='Target (After) Fit')
+      # Plot Line of Best Fit for All
+      mask = ~np.isnan(y_all_feat)
+      regression_all = LinearRegression().fit( x_all_feat[mask].reshape(-1, 1), y_all_feat[mask] )
+      ax2.plot(x_all_feat, regression_all.predict(x_all_feat.reshape(-1, 1)), color='green', linestyle='--', alpha=line_alpha, label='All Fit')
+      # Set x label for ax1
+      ax1.set_xlabel("Weeks Before and After Event")
+      ax2.set_xlabel("Weeks Before and After Event")
+      slope_before = regression_before.coef_[0]
+      slope_after = regression_after.coef_[0]
+      intercept_before = regression_before.intercept_
+      intercept_after = regression_after.intercept_
+      fig.suptitle('Effect of {} (Slope: {} Intercept: {})'.format(
+        event_name, round(slope_after-slope_before,3), round(intercept_after-intercept_before,3))
+      )
+      # Plot the average and weighted average per week
+      ax2.scatter(x_all[feat], y_all[feat], label='All', edgecolor='green', facecolors='none', alpha=circle_alpha)
+      ymin = min([min([y for y in y_all_feat if y is not None])]) - 0.05
+      ymax = max([max([y for y in y_all_feat if y is not None])]) + 0.05
+      # Format plot
+      plt.ylabel("{} Z-Score".format(feat))
+      for ax in [ax1, ax2]:
+        ax.set_xticks(x)
+        ax.set_xticklabels(xticklabels, rotation=0)
+        ax.axis(ymin=ymin, ymax=ymax)
+        ax.legend()
+      fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+      plt_name = "rdd_plots_all/rdd_{}_{}_before_after_{}.png".format(
+        num_counties_studied,feat.lower(),event_name.lower().replace(" ","_")
+      )
+      plt.savefig(plt_name) # optionally save all figures
+      # # Unique values for each week in x_all[feat] and y_all[feat]
+      # unique_x = list(set(x_all_feat[mask]))
+      # unique_x.sort()
+      # unique_y = {x:[] for x in unique_x}
+      # for x_all_feat_i, y_all_feat_i in zip(x_all_feat[mask],y_all_feat[mask]):
+      #   if y_all_feat_i not in [None,np.nan,np.inf,-np.inf]:
+      #     unique_y[x_all_feat_i].append(y_all_feat_i)
+      # print("\nUnique Values for",feat)
+      # for x in unique_x:
+      #   print("Week",x,"has",len(set(unique_y[x])),"/",len(unique_y[x]),"unique values")
+    
+    # Create a spaghetti plot of all befores and afters     
+    for feat in list_features:
+      print("\nCreating Spaghetti-Plot for",feat)
+      x_before_spaghetti_feat = np.array(x_before_spaghetti[feat])
+      y_before_spaghetti_feat = np.array(y_before_spaghetti[feat])
+      x_after_spaghetti_feat = np.array(x_after_spaghetti[feat])
+      y_after_spaghetti_feat = np.array(y_after_spaghetti[feat])
+      x_spaghetti_feat = np.array(x_spaghetti[feat])
+      y_spaghetti_feat = np.array(y_spaghetti[feat])
+      # Create a buffer around event_buffer
+      if event_buffer > 0:
+        # Remove the last event_buffer weeks from the end of before
+        x_before_spaghetti_feat = x_before_spaghetti_feat[:,:-event_buffer]
+        y_before_spaghetti_feat = y_before_spaghetti_feat[:,:-event_buffer]
+        # Remove the first event_buffer weeks from the start of after
+        x_after_spaghetti_feat = x_after_spaghetti_feat[:,event_buffer:]
+        y_after_spaghetti_feat = y_after_spaghetti_feat[:,event_buffer:]
+        # Concatenate the removed weeks into a during
+        x_during_spaghetti_feat = np.concatenate([x_before_spaghetti_feat[:,-event_buffer+1:],x_after_spaghetti_feat[:,:event_buffer-1]],axis=1)
+        y_during_spaghetti_feat = np.concatenate([y_before_spaghetti_feat[:,-event_buffer+1:],y_after_spaghetti_feat[:,:event_buffer-1]],axis=1)
+      plt.clf() # reset old plot
+      x = np.array(range(1, x_center + len(dates_after)))
+      x_before = x_before_spaghetti_feat[0]
+      x_after = x_after_spaghetti_feat[0]
+      xticklabels = [x_i - x_center for x_i in x]
+      xticklabels[x_center-1] = ""
+      line_alpha = 0.05
+      avg_alpha = 0.5
+      fill_alpha = 0.3
+      fit_alpha = 0.5
+      fig, ax1 = plt.subplots(nrows=1, ncols=1) # Horizontally stacked plots
+      fig.set_size_inches(8, 6)
+      # # Spaghetti (very thin) Plots
+      # for x_line, y_line in zip(x_before_spaghetti_feat, y_before_spaghetti_feat):
+      #   ax1.plot(x_line, y_line, color='red', alpha=line_alpha)
+      # for x_line, y_line in zip(x_after_spaghetti_feat, y_after_spaghetti_feat):
+      #   ax1.plot(x_line, y_line, color='blue', alpha=line_alpha)
+      # for x_line, y_line in zip(x_spaghetti_feat, y_spaghetti_feat):
+      #   ax2.plot(x_line, y_line, color='green', alpha=line_alpha)
+      # Standard Deviation Shading
+      ax1.fill_between(x_before_spaghetti_feat[0],
+                       np.nanmean(y_before_spaghetti_feat, axis=0) - np.nanstd(y_before_spaghetti_feat, axis=0),
+                       np.nanmean(y_before_spaghetti_feat, axis=0) + np.nanstd(y_before_spaghetti_feat, axis=0),
+                       color='red', alpha=fill_alpha)
+      ax1.fill_between(x_after_spaghetti_feat[0],
+                       np.nanmean(y_after_spaghetti_feat, axis=0) - np.nanstd(y_after_spaghetti_feat, axis=0),
+                       np.nanmean(y_after_spaghetti_feat, axis=0) + np.nanstd(y_after_spaghetti_feat, axis=0),
+                       color='blue', alpha=fill_alpha)
+      # ax2.fill_between(x, 
+      #                  np.nanmean(y_spaghetti_feat, axis=0) - np.nanstd(y_spaghetti_feat, axis=0), 
+      #                  np.nanmean(y_spaghetti_feat, axis=0) + np.nanstd(y_spaghetti_feat, axis=0), 
+      #                  color='green', alpha=fill_alpha)
+      # Plot average of Target (Before), Target (After), and All
+      ax1.plot(x_before, np.nanmean(y_before_spaghetti_feat, axis=0), color='red', linestyle='--', alpha=avg_alpha, label='Average (Before)')
+      ax1.plot(x_after, np.nanmean(y_after_spaghetti_feat, axis=0), color='blue', linestyle='--', alpha=avg_alpha, label='Average (After)')
+      if event_buffer > 0:
+        x_during = x[len(x_before)-1:-len(x_after)+1]
+        y_during = np.nanmean(y_spaghetti_feat, axis=0)[len(x_before)-1:-len(x_after)+1]
+        ax1.plot(x_during, y_during, color='green', linestyle='--', alpha=avg_alpha, label='Average (During)')
+      #ax2.plot(x, np.nanmean(y_spaghetti_feat, axis=0), color='green', linestyle='--', alpha=1, label='Average')
+      # Linear Regression Line Before, After, All
+      regression_before = LinearRegression().fit( x_before.reshape(-1, 1), np.nanmean(y_before_spaghetti_feat, axis=0) )
+      ax1.plot(x_before, regression_before.predict(x_before.reshape(-1, 1)), color='red', label='Fit (Before)', alpha=fit_alpha)
+      regression_after = LinearRegression().fit( x_after.reshape(-1, 1), np.nanmean(y_after_spaghetti_feat, axis=0) )
+      ax1.plot(x_after, regression_after.predict(x_after.reshape(-1, 1)), color='blue', label='Fit (After)', alpha=fit_alpha)
+      regression_all = LinearRegression().fit( x.reshape(-1, 1), np.nanmean(y_spaghetti_feat, axis=0) )
+      #ax2.plot(x, regression_all.predict(x.reshape(-1, 1)), color='green', label='Fit')
+      # Plot vertical line for event
+      ax1.axvline(x=x_center, color='black', linestyle='--')
+      #ax2.axvline(x=x_center, color='black', linestyle='--')
+      # Set x label for ax1
+      ax1.set_xlabel("Weeks Before and After {}".format(event_name))
+      #ax2.set_xlabel("Weeks Before and After {}".format(event_name))
+      slope_change = regression_after.coef_[0] - regression_before.coef_[0]
+      intercept_change = regression_after.intercept_ - regression_before.intercept_
+      y_change = np.nanmean(y_after_spaghetti_feat, axis=0)[0] - np.nanmean(y_before_spaghetti_feat, axis=0)[-1]
+      fig.suptitle('Effect of {} (Slope: {}, Intercept: {}, Discontinuity: {})'.format(
+        event_name, '{:+}'.format(round(slope_change,3)), '{:+}'.format(round(intercept_change,3)), '{:+}'.format(round(y_change,3)))
+      )
+      ymin = np.nanmin(y_spaghetti_feat) - 0.05
+      ymax = np.nanmax(y_spaghetti_feat) + 0.05
+      # Format plot
+      plt.ylabel("{} Z-Score".format(feat))
+      for ax in [ax1]:
+        ax.set_xticks(x)
+        ax.set_xticklabels(xticklabels, rotation=0)
+        ax.axis(ymin=ymin, ymax=ymax)
+        ax.legend()
+      fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+      plt_name = "rdd_plots_all/rdd_{}_{}_spaghetti_{}.png".format(
+        num_counties_studied, feat.lower(), event_name.lower().replace(" ","_")
+      )
+      plt.savefig(filename=plt_name)   
+      
+    # Create a SES-plot of all befores and afters
+    colors_ses = ['red','blue','green']
+    xticklabels = [x_i - x_center for x_i in x]
+    xticklabels[x_center-1] = ""
+    line_alpha = 0.05
+    avg_alpha = 0.5
+    fill_alpha = 0.3
+    fit_alpha = 0.5
+    x = np.array(range(1, x_center + default_after_end_window + 1))
+    plt.clf()
+    fig, ax1 = plt.subplots(nrows=1, ncols=1) # Horizontally stacked plots
+    fig.set_size_inches(8, 6)
+    ax1.axvline(x=x_center, color='black', linestyle='--')
+    for feat in list_features:
+      print("\nCreating SES-Plot for",feat)
+      for ses_level in [1,2,3]:
+        color_ses = colors_ses[ses_level-1]
+        x_before_spaghetti_feat = np.array(x_before_ses[feat][ses_level])
+        y_before_spaghetti_feat = np.array(y_before_ses[feat][ses_level])
+        x_after_spaghetti_feat = np.array(x_after_ses[feat][ses_level])
+        y_after_spaghetti_feat = np.array(y_after_ses[feat][ses_level])
+        x_spaghetti_feat = np.array(x_ses[feat][ses_level])
+        y_spaghetti_feat = np.array(y_ses[feat][ses_level])
+        x_before = x_before_spaghetti_feat[0]
+        x_after = x_after_spaghetti_feat[0]
+        # Plot average of Target (Before), Target (After), and All
+        ax1.plot(x_before, np.nanmean(y_before_spaghetti_feat, axis=0), color=color_ses, linestyle='--', alpha=avg_alpha, label='Average (Before)')
+        ax1.plot(x_after, np.nanmean(y_after_spaghetti_feat, axis=0), color=color_ses, linestyle='--', alpha=avg_alpha, label='Average (After)')
+        if event_buffer > 0:
+          x_during = x[len(x_before)-1:-len(x_after)+1]
+          y_during = np.nanmean(y_spaghetti_feat, axis=0)[len(x_before)-1:-len(x_after)+1]
+          ax1.plot(x_during, y_during, color=color_ses, linestyle='--', alpha=avg_alpha, label='SES {} Average'.format(ses_level))
+        # Linear Regression Line Before, After, All
+        regression_before = LinearRegression().fit( x_before.reshape(-1, 1), np.nanmean(y_before_spaghetti_feat, axis=0) )
+        ax1.plot(x_before, regression_before.predict(x_before.reshape(-1, 1)), color=color_ses, alpha=fit_alpha)
+        regression_after = LinearRegression().fit( x_after.reshape(-1, 1), np.nanmean(y_after_spaghetti_feat, axis=0) )
+        ax1.plot(x_after, regression_after.predict(x_after.reshape(-1, 1)), color=color_ses, alpha=fit_alpha)
+        regression_all = LinearRegression().fit( x.reshape(-1, 1), np.nanmean(y_spaghetti_feat, axis=0) )
+      # Set x label for ax1
+      ax1.set_xlabel("Weeks Before and After {}".format(event_name))
+      fig.suptitle('Effect of {} Across SES'.format(event_name))
+      y_ses_all = y_ses[feat][1].extend(y_ses[feat][2]).extend(y_ses[feat][3])
+      ymin = np.nanmin(y_ses_all) - 0.05
+      ymax = np.nanmax(y_ses_all) + 0.05
+      # Format plot
+      plt.ylabel("{} Z-Score".format(feat))
+      for ax in [ax1]:
+        ax.set_xticks(x)
+        ax.set_xticklabels(xticklabels, rotation=0)
+        ax.axis(ymin=ymin, ymax=ymax)
+        ax.legend()
+      fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+      plt_name = "rdd_plots_all/rdd_{}_{}_ses_{}.png".format(
+        num_counties_studied, feat.lower(), event_name.lower().replace(" ","_")
+      )
+      plt.savefig(filename=plt_name)  
+        
     
     # Create a pandas dataframe
     print("\nCreating Pandas Dataframe of Outcomes")
-    columns = ['fips','county','feat','event_name','event_date','event_date_centered','target_before_slope','target_after_slope','target_before_intercept','target_after_intercept','target_diff_slope','target_diff_intercept','intervention_effect','intervention_percent']
+    columns = ['fips','county','feat','event_name','event_date','event_date_centered','target_before_slope','target_after_slope','target_before_intercept','target_after_intercept','target_diff_slope','target_diff_intercept','slope_effect','intercept_effect']
     output = pd.DataFrame(output_dicts)[columns]
+    output = output.dropna()
     print(output.sort_values(by=['fips','feat']))
     
     # Merge the SES data
@@ -552,7 +812,7 @@ with connection:
     
     def print_outputs(output_df):
       output_df = output_df.copy(deep=True)
-      outcomes  = ['intervention_effect','intervention_percent']
+      outcomes  = ['slope_effect','intercept_effect']
       for feat in list_features:
         print("\nMean findings for",feat)
         outcomes_feat = output_df[output_df['feat'] == feat]
@@ -575,7 +835,7 @@ with connection:
     for feat in list_features:
       print("\nCorrelation for",feat)
       outcomes_feat = output[output['feat'] == feat]
-      outcome = 'intervention_effect'
+      outcome = 'intercept_effect'
       dat = outcomes_feat[outcome].replace([np.inf, -np.inf], np.nan).dropna()
       for col in corr_columns:
         corr = np.corrcoef(dat,output[col].loc[dat.index])[0,1]
@@ -586,24 +846,3 @@ with connection:
       
       # Write the output to a CSV
       output.to_csv("rdd_data.csv",index=False)
-      
-      # Plot the amount change over time
-      for feat in list_features:
-        plt.clf()
-        fig, ax = plt.subplots()
-        fig.set_size_inches(6, 6)
-        for amount_change, key in sorted(amount_change_map.items(), key=lambda x: x[1][2]): # sort by middle_middle
-          # Plot the amount_change over middle_middle
-          _, feat_here, middle_middle = key
-          if feat_here != feat:
-            continue
-          plt.plot(middle_middle, amount_change, 'b+', alpha=0.3)
-        plt.title("{} Amount Change Over Time".format(feat))
-        plt.ylabel("{} Change".format(feat))
-        plt.xlabel("Event Date")
-        # rotate x-axis labels
-        plt.xticks(rotation=45, ha='right')
-        plt.tight_layout()
-        plt_name = "over_time_changes/amount_change_{}_before_after_event.png".format(feat)
-        plt.savefig(plt_name)
-        print("Saved",plt_name)
