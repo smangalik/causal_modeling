@@ -743,10 +743,8 @@ with connection:
     colors_ses = ['red','blue','green']
     xticklabels = [x_i - x_center for x_i in x]
     xticklabels[x_center-1] = ""
-    line_alpha = 0.05
-    avg_alpha = 0.5
-    fill_alpha = 0.3
-    fit_alpha = 0.5
+    avg_alpha = 0.3
+    fit_alpha = 0.7
     x = np.array(range(1, x_center + default_after_end_window + 1))
     plt.clf()
     fig, ax1 = plt.subplots(nrows=1, ncols=1) # Horizontally stacked plots
@@ -762,21 +760,20 @@ with connection:
         y_after_spaghetti_feat = np.array(y_after_ses[feat][ses_level])
         x_spaghetti_feat = np.array(x_ses[feat][ses_level])
         y_spaghetti_feat = np.array(y_ses[feat][ses_level])
+        if event_buffer > 0:
+          x_before_spaghetti_feat = x_before_spaghetti_feat[:,:-event_buffer]
+          y_before_spaghetti_feat = y_before_spaghetti_feat[:,:-event_buffer]
+          x_after_spaghetti_feat = x_after_spaghetti_feat[:,event_buffer:]
+          y_after_spaghetti_feat = y_after_spaghetti_feat[:,event_buffer:]
         x_before = x_before_spaghetti_feat[0]
         x_after = x_after_spaghetti_feat[0]
-        # Plot average of Target (Before), Target (After), and All
-        ax1.plot(x_before, np.nanmean(y_before_spaghetti_feat, axis=0), color=color_ses, linestyle='--', alpha=avg_alpha, label='Average (Before)')
-        ax1.plot(x_after, np.nanmean(y_after_spaghetti_feat, axis=0), color=color_ses, linestyle='--', alpha=avg_alpha, label='Average (After)')
-        if event_buffer > 0:
-          x_during = x[len(x_before)-1:-len(x_after)+1]
-          y_during = np.nanmean(y_spaghetti_feat, axis=0)[len(x_before)-1:-len(x_after)+1]
-          ax1.plot(x_during, y_during, color=color_ses, linestyle='--', alpha=avg_alpha, label='SES {} Average'.format(ses_level))
+        # Plot average of All
+        ax1.plot(x, np.nanmean(y_spaghetti_feat, axis=0), color=color_ses, linestyle='--', alpha=avg_alpha, label='SES {} Average'.format(ses_level))
         # Linear Regression Line Before, After, All
         regression_before = LinearRegression().fit( x_before.reshape(-1, 1), np.nanmean(y_before_spaghetti_feat, axis=0) )
         ax1.plot(x_before, regression_before.predict(x_before.reshape(-1, 1)), color=color_ses, alpha=fit_alpha)
         regression_after = LinearRegression().fit( x_after.reshape(-1, 1), np.nanmean(y_after_spaghetti_feat, axis=0) )
         ax1.plot(x_after, regression_after.predict(x_after.reshape(-1, 1)), color=color_ses, alpha=fit_alpha)
-        regression_all = LinearRegression().fit( x.reshape(-1, 1), np.nanmean(y_spaghetti_feat, axis=0) )
       # Set x label for ax1
       ax1.set_xlabel("Weeks Before and After {}".format(event_name))
       fig.suptitle('Effect of {} Across SES'.format(event_name))
