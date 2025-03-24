@@ -780,7 +780,9 @@ with connection:
       # Set x label for ax1
       ax1.set_xlabel("Weeks Before and After {}".format(event_name))
       fig.suptitle('Effect of {} Across SES'.format(event_name))
-      y_ses_all = y_ses[feat][1].extend(y_ses[feat][2]).extend(y_ses[feat][3])
+      y_ses_all = y_ses[feat][1]
+      y_ses_all.extend(y_ses[feat][2])
+      y_ses_all.extend(y_ses[feat][3])
       ymin = np.nanmin(y_ses_all) - 0.05
       ymax = np.nanmax(y_ses_all) + 0.05
       # Format plot
