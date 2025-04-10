@@ -33,14 +33,25 @@ warnings.catch_warnings()
 warnings.simplefilter("ignore")
 
 parser = argparse.ArgumentParser(description="Process feature table for RDD analysis")
-parser.add_argument('--random', dest="random", default=False ,action='store_true', help='Assigns random valid events to each county')
 parser.add_argument('--covid_case', dest="covid_case", default=False ,action='store_true', help='Evaluate the first COVID-19 case per county')
 parser.add_argument('--covid_death', dest="covid_death", default=False ,action='store_true', help='Evaluate the first COVID-19 death per county')
 parser.add_argument('--worst_shooting', dest="worst_shooting", default=False ,action='store_true', help='Evaluate the worst fatal shooting per county')
+parser.add_argument('--fires_start', dest="fires_start", default=False ,action='store_true', help='Evaluate when the CA fires started per county')
+parser.add_argument('--mask_mandate', dest="mask_mandate", default=False ,action='store_true', help='Evaluate when the mask mandate started per county')
+parser.add_argument('--outdoor_policy_start', dest="outdoor_policy_start", default=False ,action='store_true', help='Evaluate when the outdoor and recreation policy started per county')
+parser.add_argument('--outdoor_policy_stop', dest="outdoor_policy_stop", default=False ,action='store_true', help='Evaluate when the outdoor and recreation policy stopped per county')
+parser.add_argument('--childcare_policy_start', dest="childcare_policy_start", default=False ,action='store_true', help='Evaluate when the childcare policy started per county')
+parser.add_argument('--entertainment_policy_start', dest="entertainment_policy_start", default=False ,action='store_true', help='Evaluate when the entertainment policy started per county')
+parser.add_argument('--nonessential_business_policy_start', dest="nonessential_business_policy_start", default=False ,action='store_true', help='Evaluate when the nonessential business policy started per county')
+parser.add_argument('--shelter_policy_start', dest="shelter_policy_start", default=False ,action='store_true', help='Evaluate when the shelter in place policy started per county')
+parser.add_argument('--shelter_policy_stop', dest="shelter_policy_stop", default=False ,action='store_true', help='Evaluate when the shelter in place policy stopped per county')
+parser.add_argument('--worship_policy_start', dest="worship_policy_start", default=False ,action='store_true', help='Evaluate when the worship policy started per county')
+parser.add_argument('--restaurant_policy_start', dest="restaurant_policy_start", default=False ,action='store_true', help='Evaluate when the restaurant policy started per county')
+parser.add_argument('--stay_home_policy_start', dest="stay_home_policy_start", default=False ,action='store_true', help='Evaluate when the mandatory stay at home policy started per county')
+parser.add_argument('--advise_home_policy_start', dest="advise_home_policy_start", default=False ,action='store_true', help='Evaluate when the advise you stay at home policy started per county')
+parser.add_argument('--carryout_policy_start', dest="carryout_policy_start", default=False ,action='store_true', help='Evaluate when the carryout policy started per county')
+parser.add_argument('--social_distance_policy_start', dest="social_distance_policy_start", default=False ,action='store_true', help='Evaluate when the social distance policy started per county')
 args = parser.parse_args()
-
-# is the analysis being done on topics? (topic_num needs to be interpreted)
-randomize_events = args.random
 
 # Where to load data from
 data_file = "/data/smangalik/lbmha_yw_cnty.csv" # from research repo
@@ -103,6 +114,114 @@ for i, row in shootings_df.iterrows():
   date = row['date']
   worst_shooting[fips] = [date, None, "Worst Shooting"]
   
+# Load Wildfires Data
+file_path = "/data/marif/california_fires_cleaned.csv"
+print("\nLoading Wildfires Data from", file_path)
+# Assuming cf_2020 is already filtered for 2020 incidents and has necessary columns
+cf_2020 = pd.read_csv(file_path)
+cf_2020 = cf_2020[pd.notna(cf_2020["fips_code"]) & ~cf_2020["fips_code"].isin([float('inf'), float('-inf')])]
+cf_2020["fips_code"] = cf_2020["fips_code"].astype(int).astype(str).str.zfill(5)
+county_fire_dict = {} # Initialize an empty dictionary to store the results
+# Group by the 'fips_code' (or 'incident_county' if needed) to iterate over each county
+for county, group in cf_2020.groupby('fips_code'):
+    # Find the row with the maximum acres burned for the county
+    max_fire = group.loc[group['incident_acres_burned'].idxmax()]
+    # Extract the required values
+    start_date = max_fire['incident_dateonly_created']
+    event_name = max_fire['incident_name']
+    # Add the information to the dictionary with the FIPS code as the key
+    start_datetime = datetime.datetime.strptime(start_date, '%m/%d/%Y')
+    county_fire_dict[county] = [start_datetime, None, event_name]
+# print(county_fire_dict) # Display the resulting dictionary
+
+# Load Mask Mandate Data
+file_path = "/data/smangalik/mask_mandate.csv"
+print("\nLoading mask mandate data from", file_path)
+mask_mandate = pd.read_csv(file_path, usecols=["FIPS_Code", "Face_Masks_Required_in_Public", "date"])
+#print("Filtering mask mandate data...")
+mask_mandate = mask_mandate[pd.notna(mask_mandate["FIPS_Code"]) & ~mask_mandate["FIPS_Code"].isin([float('inf'), float('-inf')])]
+mask_mandate["FIPS_Code"] = mask_mandate["FIPS_Code"].astype(int).astype(str).str.zfill(5)
+# Filter rows where 'Face_Masks_Required_in_Public' is 'Yes'
+df_yes = mask_mandate[mask_mandate["Face_Masks_Required_in_Public"] == "Yes"]
+#print("Converting to Date Time...")
+#mask_mandate.columns = mask_mandate.columns.str.strip()
+df_yes["date"] = pd.to_datetime(df_yes["date"], format='%m/%d/%Y', errors='coerce')
+# Sort data by FIPS_Code and date to ensure correct ordering
+#print("Sorting mask mandate data...")
+df_yes = df_yes.sort_values(by=["FIPS_Code", "date"])
+mask_mandate = {}
+# Identify the start and end dates for each county
+#print("Identifying start and end dates for each county...")
+for fips_code, group in df_yes.groupby("FIPS_Code"):
+    start_date = group["date"].min()  # First occurrence of "Yes"
+    end_date = group["date"].max()    # Last occurrence of "Yes"
+    # if date not in 2020, skip
+    if start_date.year != 2020:
+      continue
+    mask_mandate[fips_code] = [start_date, end_date, "mask_mandate"]
+# print(mask_mandate)
+
+# TODO Load policy events data
+print("\nLoading policy events data...")
+policy_events = {}
+# policy_mapping = {
+#   "/data/marif/restaurant_covid_policies.csv": ['Curbside/carryout/delivery only',
+#                                                 'Open with social distancing/reduced seating/enhanced sanitation'],
+#   "/data/marif/county_stay_at_home_orders.csv": ['Mandatory for all individuals','Advisory/Recommendation'],
+# }
+# fips = pd.read_csv("/data/marif/us_fips_codes.csv")
+# fips["state_fips"] = fips["state_fips"].astype(str).str.zfill(2)
+# fips["county_fips"] = fips["county_fips"].astype(str).str.zfill(3)
+# states = pd.read_csv("/data/marif/state_abbreviations.csv")
+# fips = fips.merge(states, on="state", how="left")
+# fips["fips_code"] = fips["state_fips"].astype(str) + fips["county_fips"].astype(str)
+# fips["county"] = fips["county"] + " County"
+# for policy_csv, actions in policy_mapping.items():
+#   for action in actions:
+#     event_df = pd.read_csv(policy_csv, dtype={9: str, 15: str})  # Use str if they should be treated as strings
+#     event_df = event_df.merge(fips[["county", "abbreviation", "fips_code"]],  
+#                   left_on=["County_Name", "state"],  
+#                   right_on=["county", "abbreviation"],  
+#                   how="left")  
+#     event_df["date"] = pd.to_datetime(event_df["date"], format="%m/%d/%Y", errors="coerce")
+#     event_df = event_df.sort_values(by=["fips_code", "date"])
+#     # Filter rows where Action is in the list of actions
+#     try:
+#       event_df = event_df[event_df['Action'] == action]
+#     except Exception as e:
+#       print("Error filtering actions: {} for {}".format(policy_csv, action))
+#       print(e)
+#       sys.exit(1)
+#     # Group by fips_code and get the first state_date for each fips_code
+#     policy_events[action] = {}
+#     for fips_code, group in event_df.groupby('fips_code'):
+#         # Get the first state_date for each fips_code
+#         first_state_date = group['date'].iloc[0]
+#         # Add to dictionary, with fips_code as the key and (state_date, None, 'mandatory') as the value
+#         policy_events[action][fips_code] = (first_state_date, None, action)
+  
+# Load more county events
+print("\nLoading more policy events data...")
+events = "/data/marif/covid_county_policy_orders.csv"
+policy_types = [("Food and Drink","start"),("Houses of Worship","start"),("Shelter in Place","start"),("Shelter in Place","stop"),
+          ("Non-Essential Businesses","start"),("Entertainment","start"),("Childcare","start"),("Childcare","stop"),
+          ("Outdoor and Recreation","start"),("Outdoor and Recreation","stop")]
+for policy_type, start_stop in policy_types:
+  event_df = pd.read_csv(events)
+  df_county = event_df[event_df["policy_level"] == "county"]
+  df_county = df_county[pd.notna(df_county["fips_code"]) & ~df_county["fips_code"].isin([float("inf"), float("-inf")])]
+  df_county["fips_code"] = df_county["fips_code"].astype(int).astype(str).str.zfill(5)
+  df_county = df_county[df_county["date"].astype(str).str[:4] == "2020"]
+  df_county["date"] = pd.to_datetime(df_county["date"], format='%Y/%m/%d', errors='coerce')
+  df_county = df_county.dropna(subset=["fips_code"])
+  food_and_drink_start_dict = {
+      row["fips_code"]: (row["date"], None, "{} {}".format(policy_type, start_stop.title()))
+      for _, row in df_county[
+          (df_county["policy_type"] == policy_type) & 
+          (df_county["start_stop"] == start_stop)
+      ].iterrows()
+  }  
+  
 # Control events, randomly drawn from uniform distribution
 control_events = {}
 for fips in fips_to_population.keys():
@@ -112,29 +231,29 @@ for fips in fips_to_population.keys():
         
 # Pick the events to use
 if args.covid_case:
-  print("Using First Covid Case Events")
+  print("\nUsing First Covid Case Events")
   county_events = first_covid_case
   event_name = "First Covid Case"
 elif args.covid_death:
-  print("Using First Covid Death Events")
+  print("\nUsing First Covid Death Events")
   county_events = first_covid_death
   event_name = "First Covid Death"
 elif args.worst_shooting:
-  print("Using Worst Shooting Events")
+  print("\nUsing Worst Shooting Events")
   county_events = worst_shooting
   event_name = "Worst Shooting"
+elif args.fires_start:
+  print("\nUsing Wildfires Start Events")
+  county_events = county_fire_dict
+  event_name = "Wildfires Start"
+elif args.mask_mandate:
+  print("\nUsing Mask Mandate Events")
+  county_events = mask_mandate
+  event_name = "Mask Mandate"
 else:
-  print("NO EVENT CHOSEN, defaulting to control events")
+  print("\nNO EVENT CHOSEN, defaulting to control events")
   county_events = control_events
   event_name = "Control Event"
-
-if randomize_events:
-  # get unique event dates from the events
-  possible_event_dates = list(set([event_start for event_start, _, _ in county_events.values()]))
-  print("Randomizing Events with",len(possible_event_dates),"Possible Dates")
-  import random
-  for fips in county_events.keys():
-    county_events[fips] = [random.choice(possible_event_dates),None,"Random Event"]
 
 print('Connecting to MySQL...')
 
@@ -282,6 +401,7 @@ with connection:
     df['cnty'] = df['cnty'].astype(str).str.zfill(5)
     df['feat'] = df['score_category'].str.replace('DEP_SCORE','Depression').replace('ANX_SCORE','Anxiety').replace('WEC_sadF','Sad').replace('WEB_worryF','Worry')
     score_col = 'score'
+    std_col = 'score_std'
 
     # Require n_users >= UT for each county
     df = df[df['n_users'] >= ut]
@@ -298,9 +418,11 @@ with connection:
     
     print("Loading Unique Features:",list_features)
     county_feats = defaultdict(lambda: defaultdict(dict))
+    county_feats_std = defaultdict(lambda: defaultdict(dict))
     grouped = df.groupby(['feat', 'cnty', 'yearweek'])
     for (feat, county, yearweek), group in tqdm(grouped):
         county_feats[county][yearweek][feat] = group[score_col].iloc[0]
+        county_feats_std[county][yearweek][feat] = group[std_col].iloc[0]
     county_feats = {k: dict(v) for k, v in county_feats.items()} # Convert to a regular dict
 
     # Calculate Average and Weighted Average Weekly Feat Score for Baselines
@@ -343,6 +465,7 @@ with connection:
     
     target_counties = set(populous_counties)
     missing_counties = set()
+    x_center = default_before_start_window + 1
     
     # All outcomes
     x_before_all = {feat:[] for feat in list_features}
@@ -368,6 +491,13 @@ with connection:
     x_ses = {feat:{1:[], 2:[], 3:[]} for feat in list_features}
     y_ses = {feat:{1:[], 2:[], 3:[]} for feat in list_features}
     
+    # County outcomes
+    x_before_county = {feat:{} for feat in list_features}
+    y_before_county = {feat:{} for feat in list_features}
+    x_after_county = {feat:{} for feat in list_features}
+    y_after_county = {feat:{} for feat in list_features}
+    x_county = {feat:{} for feat in list_features}
+    y_county = {feat:{} for feat in list_features}
     
     print("\nCalculating RDDs for",len(target_counties),"counties")
     for target in tqdm(target_counties):
@@ -422,35 +552,11 @@ with connection:
         _, end_after = yearweek_to_dates(max(dates_after))
         middle_before = begin_before + (end_before - begin_before)/2
         middle_after = begin_after + (end_after - begin_after)/2
-        middle_middle = middle_before + (middle_after - middle_before)/2
-
-        # For writing to a dataframe
-        pandas_entry = {
-          "fips": target, # FIPS code of the county
-          "county": fips_to_name.get(target), # Name of the county
-          "feat": feat, # Either Depression or Anxiety
-          "event_name": event_name, # Name of the event that we are measuring the feat before and after
-          "event_date": target_event_start, # Date of the event
-          "event_date_centered": middle_middle, # The date in the middle of the week containing the event_date   
-          "target_before_slope": target_before[0], # feat score before the event
-          "target_after_slope": target_after[0], # feat score after the event
-          "target_before_intercept": target_before[1], # feat score before the event
-          "target_after_intercept": target_after[1], # feat score after the event
-          "target_diff_slope": target_diff[0], # feat score after - feat score before
-          "target_diff_intercept": target_diff[1], # feat score after - feat score before
-          "slope_effect": slope_effect,
-          "intercept_effect": intercept_effect, 
-          "ses": county_to_ses.get(target), # Socioeconomic Status of the county
-        }
-        output_dicts.append(pandas_entry)     
-        
-        if randomize_events:
-          continue # skip plotting for randomized events
+        middle_middle = middle_before + (middle_after - middle_before)/2 
 
         # --- Calculate Before and After Values ---
 
         # Calculate in-between dates and xticks
-        x_center = len(dates_before)
         x = np.array(range(1, x_center + len(dates_after)))
         xticklabels = [
             x_i - x_center for x_i in x
@@ -464,61 +570,97 @@ with connection:
         # y_after =  [ avg_county_list_usages[yw][feat] if yw in avg_county_list_usages else np.nan for yw in dates_after ]
         y_before = [ county_feats[target][yw][feat] if yw in county_feats[target].keys() else np.nan for yw in dates_before ]
         y_after =  [ county_feats[target][yw][feat] if yw in county_feats[target].keys() else np.nan for yw in dates_after ]
+        y_before_std = [ county_feats_std[target][yw][feat] if yw in county_feats_std[target].keys() else 0.0 for yw in dates_before ]
+        y_after_std =  [ county_feats_std[target][yw][feat] if yw in county_feats_std[target].keys() else 0.0 for yw in dates_after ]
+        y_all_std = y_before_std + y_after_std[1:] # skip the first repeat date in "after"
         y_vals = np.array(y_before + y_after[1:]) # skip the first repeat date in "after"
         y_before = np.array(y_before)
         y_after = np.array(y_after)
+        # First after that is not NaN - Last before that is not NaN
+        target_discontinuity = y_after[event_buffer] - y_before[-event_buffer]
+        
+        # Arrays to list for saving (gives a meaningful speed up)
+        x_before_list = x_before.tolist()
+        x_after_list = x_after.tolist()
+        x_list = list(np.concatenate([x_before,x_after[1:]]))
+        y_before_list = y_before.tolist()
+        y_after_list = y_after.tolist()
+        y_list = list(np.concatenate([y_before,y_after[1:]]))
         
         # Store all y_vals for mega-plot
-        x_before_all[feat].extend(x_before.tolist())
-        x_after_all[feat].extend(x_after.tolist())
-        x_all[feat] += list(np.concatenate([x_before,x_after[1:]]))
-        y_before_all[feat].extend(y_before.tolist())
-        y_after_all[feat].extend(y_after.tolist())
-        y_all[feat] += list(np.concatenate([y_before,y_after[1:]]))
+        x_before_all[feat].extend(x_before_list)
+        x_after_all[feat].extend(x_after_list)
+        x_all[feat] += x_list
+        y_before_all[feat].extend(y_before_list)
+        y_after_all[feat].extend(y_after_list)
+        y_all[feat] += y_list
         
         # Store all vals for spaghetti-plot
-        x_before_spaghetti[feat].append(x_before.tolist())
-        x_after_spaghetti[feat].append(x_after.tolist())
-        x_spaghetti[feat].append(list(np.concatenate([x_before,x_after[1:]])))
-        y_before_spaghetti[feat].append(y_before.tolist())
-        y_after_spaghetti[feat].append(y_after.tolist())
-        y_spaghetti[feat].append(list(np.concatenate([y_before,y_after[1:]])))
+        x_before_spaghetti[feat].append(x_before_list)
+        x_after_spaghetti[feat].append(x_after_list)
+        x_spaghetti[feat].append(x_list)
+        y_before_spaghetti[feat].append(y_before_list)
+        y_after_spaghetti[feat].append(y_after_list)
+        y_spaghetti[feat].append(y_list)
         
         # Store all vals for SES-plot
-        x_before_ses[feat][county_to_ses[target]].append(x_before.tolist())
-        x_after_ses[feat][county_to_ses[target]].append(x_after.tolist())
-        x_ses[feat][county_to_ses[target]].append(list(np.concatenate([x_before,x_after[1:]])))
-        y_before_ses[feat][county_to_ses[target]].append(y_before.tolist())
-        y_after_ses[feat][county_to_ses[target]].append(y_after.tolist())
-        y_ses[feat][county_to_ses[target]].append(list(np.concatenate([y_before,y_after[1:]])))
+        x_before_ses[feat][county_to_ses[target]].append(x_before_list)
+        x_after_ses[feat][county_to_ses[target]].append(x_after_list)
+        x_ses[feat][county_to_ses[target]].append(x_list)
+        y_before_ses[feat][county_to_ses[target]].append(y_before_list)
+        y_after_ses[feat][county_to_ses[target]].append(y_after_list)
+        y_ses[feat][county_to_ses[target]].append(y_list)
+        
+        # Store all vals for County-plot
+        # Skip if empty
+        if x_before.size > 0 and x_after.size > 0:
+          x_before_county[feat][target] = x_before_list
+          x_after_county[feat][target] = x_after_list
+          x_county[feat][target] = list(x_list)
+          y_before_county[feat][target] = y_before_list
+          y_after_county[feat][target] = y_after_list
+          y_county[feat][target] = y_list
+        
+        
+        # For writing to a dataframe
+        pandas_entry = {
+          "fips": target, # FIPS code of the county
+          "county": fips_to_name.get(target), # Name of the county
+          "feat": feat, # Either Depression or Anxiety
+          "event_name": event_name, # Name of the event that we are measuring the feat before and after
+          "event_date": target_event_start, # Date of the event
+          "event_date_centered": middle_middle, # The date in the middle of the week containing the event_date   
+          "target_before": str(y_before), # feat scores before the event
+          "target_after": str(y_after), # feat scores after the event
+          "target_before_slope": target_before[0], # feat score before the event
+          "target_after_slope": target_after[0], # feat score after the event
+          "target_before_intercept": target_before[1], # feat score before the event
+          "target_after_intercept": target_after[1], # feat score after the event
+          "target_diff_slope": target_diff[0], # feat score after - feat score before
+          "target_diff_intercept": target_diff[1], # feat score after - feat score before
+          "target_discontinuity": target_discontinuity, # feat score after - feat score before (w/ event_buffer)
+          "slope_effect": slope_effect,
+          "intercept_effect": intercept_effect, 
+          "ses": county_to_ses.get(target), # Socioeconomic Status of the county
+        }
+        output_dicts.append(pandas_entry)   
         
         # Only plot significant results
         if not is_significant:
-          continue # only plot significant results
-        else:
-          # print("Target Before:                                 ", target_before)
-          # print("Target After (with intervention / observation):", target_after)
-          # print("Target After (without intervention / expected):", target_expected)
-          # print("Intercept Effect:                           ", intercept_effect)
-          # print("From {} matches, giving {} matched befores and {} matched afters".format(
-          #   len(matched_counties[target][feat]), len(matched_befores[target]),len(matched_afters[target])))
-          # print("Plotting: County {} ({}) for {}\n --- ".format(feat,target,event_name))  
-          pass        
+          continue # only plot significant results    
         
         # --- Plotting ---
 
-        # Create RDD Plot
+        # Create County-Level RDD Plot
         plt.clf() # reset old plot
         fig, (ax1, ax2) = plt.subplots(nrows=1, ncols=2) # Horizontally stacked plots
         fig.set_size_inches(20, 6)
         ax1.scatter(x[:x_center-1], y_vals[:x_center-1], label='Target (Before)')
         ax1.scatter(x[x_center-1], y_vals[x_center-1], color='black',label='Target (During)')
-        ax1.scatter(x[x_center:], y_vals[x_center:], label='Target (After)')
-        
-        # print('x_before',x_before)
-        # print('y_before',y_before)
-        # print('x_after',x_after)
-        # print('y_after',y_after)        
+        ax1.scatter(x[x_center:], y_vals[x_center:], label='Target (After)')       
+        # Add error bars
+        ax1.errorbar(x_before, y_before, yerr=y_before_std, fmt='o', capsize=4.0, color='blue',  alpha=0.3)
+        ax1.errorbar(x_after, y_after, yerr=y_after_std, fmt='o', capsize=4.0, color='orange', alpha=0.3)
         
         # Plot vertical line for event
         ax1.axvline(x=x_center, color='black', linestyle='--', label='Event')
@@ -527,7 +669,7 @@ with connection:
         # Plot line of best fit for Target (Before)
         mask = ~np.isnan(y_before)
         regression = LinearRegression().fit( x_before[mask].reshape(-1, 1), y_before[mask] )
-        ax1.plot(x_before, regression.predict(x_before.reshape(-1, 1)), color='blue', linestyle='--', alpha=0.3, label='Target (Before) Fit')
+        ax1.plot(x_before, regression.predict(x_before.reshape(-1, 1)), color='blue',linestyle='--', alpha=0.3, label='Target (Before) Fit')
         
         # Plot line of best fit for Target (After)
         mask = ~np.isnan(y_after)
@@ -549,8 +691,8 @@ with connection:
         )
         
         # Plot the average and weighted average per week
-        
         ax2.scatter(x, y_vals, color='green', label='All', alpha=0.8)
+        ax2.errorbar(x, y_vals, yerr=y_all_std, fmt='o', color='green', capsize=4.0, alpha=0.3)
 
 
         ymin = min([min([y for y in y_vals if y is not None])])
@@ -583,7 +725,7 @@ with connection:
       x_all_feat = np.array(x_all[feat])
       y_all_feat = np.array(y_all[feat])
       plt.clf() # reset old plot
-      x = np.array(range(1, x_center + len(dates_after)))
+      x = np.array(range(1, default_before_start_window + 1 + default_before_start_window + 1))
       xticklabels = [x_i - x_center for x_i in x]
       xticklabels[x_center-1] = ""
       circle_size = 100
@@ -602,8 +744,13 @@ with connection:
       ax1.plot(x_before_all_feat, regression_before.predict(x_before_all_feat.reshape(-1, 1)), color='red', linestyle='--', alpha=line_alpha, label='Target (Before) Fit')
       # Plot line of best fit for Target (After)
       mask = ~np.isnan(y_after_all_feat)
-      regression_after = LinearRegression().fit( x_after_all_feat[mask].reshape(-1, 1), y_after_all_feat[mask] )
-      ax1.plot(x_after_all_feat, regression_after.predict(x_after_all_feat.reshape(-1, 1)), color='blue', linestyle='--', alpha=line_alpha, label='Target (After) Fit')
+      try:
+        regression_after = LinearRegression().fit( x_after_all_feat[mask].reshape(-1, 1), y_after_all_feat[mask] )
+        ax1.plot(x_after_all_feat, regression_after.predict(x_after_all_feat.reshape(-1, 1)), color='blue', linestyle='--', alpha=line_alpha, label='Target (After) Fit')
+      except Exception as e:
+        print("Error with plotting",feat)
+        print(e)
+        continue
       # Plot Line of Best Fit for All
       mask = ~np.isnan(y_all_feat)
       regression_all = LinearRegression().fit( x_all_feat[mask].reshape(-1, 1), y_all_feat[mask] )
@@ -634,16 +781,6 @@ with connection:
         num_counties_studied,feat.lower(),event_name.lower().replace(" ","_")
       )
       plt.savefig(plt_name) # optionally save all figures
-      # # Unique values for each week in x_all[feat] and y_all[feat]
-      # unique_x = list(set(x_all_feat[mask]))
-      # unique_x.sort()
-      # unique_y = {x:[] for x in unique_x}
-      # for x_all_feat_i, y_all_feat_i in zip(x_all_feat[mask],y_all_feat[mask]):
-      #   if y_all_feat_i not in [None,np.nan,np.inf,-np.inf]:
-      #     unique_y[x_all_feat_i].append(y_all_feat_i)
-      # print("\nUnique Values for",feat)
-      # for x in unique_x:
-      #   print("Week",x,"has",len(set(unique_y[x])),"/",len(unique_y[x]),"unique values")
     
     # Create a spaghetti plot of all befores and afters     
     for feat in list_features:
@@ -706,10 +843,15 @@ with connection:
         ax1.plot(x_during, y_during, color='green', linestyle='--', alpha=avg_alpha, label='Average (During)')
       #ax2.plot(x, np.nanmean(y_spaghetti_feat, axis=0), color='green', linestyle='--', alpha=1, label='Average')
       # Linear Regression Line Before, After, All
-      regression_before = LinearRegression().fit( x_before.reshape(-1, 1), np.nanmean(y_before_spaghetti_feat, axis=0) )
-      ax1.plot(x_before, regression_before.predict(x_before.reshape(-1, 1)), color='red', label='Fit (Before)', alpha=fit_alpha)
-      regression_after = LinearRegression().fit( x_after.reshape(-1, 1), np.nanmean(y_after_spaghetti_feat, axis=0) )
-      ax1.plot(x_after, regression_after.predict(x_after.reshape(-1, 1)), color='blue', label='Fit (After)', alpha=fit_alpha)
+      try:
+        regression_before = LinearRegression().fit( x_before.reshape(-1, 1), np.nanmean(y_before_spaghetti_feat, axis=0) )
+        ax1.plot(x_before, regression_before.predict(x_before.reshape(-1, 1)), color='red', label='Fit (Before)', alpha=fit_alpha)
+        regression_after = LinearRegression().fit( x_after.reshape(-1, 1), np.nanmean(y_after_spaghetti_feat, axis=0) )
+        ax1.plot(x_after, regression_after.predict(x_after.reshape(-1, 1)), color='blue', label='Fit (After)', alpha=fit_alpha)
+      except Exception as e:
+        print("Error with plotting",feat)
+        print(e)
+        continue
       regression_all = LinearRegression().fit( x.reshape(-1, 1), np.nanmean(y_spaghetti_feat, axis=0) )
       #ax2.plot(x, regression_all.predict(x.reshape(-1, 1)), color='green', label='Fit')
       # Plot vertical line for event
@@ -739,66 +881,103 @@ with connection:
       )
       plt.savefig(filename=plt_name)   
       
-    # Create a SES-plot of all befores and afters
-    colors_ses = ['red','blue','green']
-    xticklabels = [x_i - x_center for x_i in x]
-    xticklabels[x_center-1] = ""
-    avg_alpha = 0.3
-    fit_alpha = 0.7
-    x = np.array(range(1, x_center + default_after_end_window + 1))
-    plt.clf()
-    fig, ax1 = plt.subplots(nrows=1, ncols=1) # Horizontally stacked plots
-    fig.set_size_inches(8, 6)
-    ax1.axvline(x=x_center, color='black', linestyle='--')
-    for feat in list_features:
-      print("\nCreating SES-Plot for",feat)
-      for ses_level in [1,2,3]:
-        color_ses = colors_ses[ses_level-1]
-        x_before_spaghetti_feat = np.array(x_before_ses[feat][ses_level])
-        y_before_spaghetti_feat = np.array(y_before_ses[feat][ses_level])
-        x_after_spaghetti_feat = np.array(x_after_ses[feat][ses_level])
-        y_after_spaghetti_feat = np.array(y_after_ses[feat][ses_level])
-        x_spaghetti_feat = np.array(x_ses[feat][ses_level])
-        y_spaghetti_feat = np.array(y_ses[feat][ses_level])
-        if event_buffer > 0:
-          x_before_spaghetti_feat = x_before_spaghetti_feat[:,:-event_buffer]
-          y_before_spaghetti_feat = y_before_spaghetti_feat[:,:-event_buffer]
-          x_after_spaghetti_feat = x_after_spaghetti_feat[:,event_buffer:]
-          y_after_spaghetti_feat = y_after_spaghetti_feat[:,event_buffer:]
-        x_before = x_before_spaghetti_feat[0]
-        x_after = x_after_spaghetti_feat[0]
-        # Plot average of All
-        ax1.plot(x, np.nanmean(y_spaghetti_feat, axis=0), color=color_ses, linestyle='--', alpha=avg_alpha, label='SES {} Average'.format(ses_level))
-        # Linear Regression Line Before, After, All
-        regression_before = LinearRegression().fit( x_before.reshape(-1, 1), np.nanmean(y_before_spaghetti_feat, axis=0) )
-        ax1.plot(x_before, regression_before.predict(x_before.reshape(-1, 1)), color=color_ses, alpha=fit_alpha)
-        regression_after = LinearRegression().fit( x_after.reshape(-1, 1), np.nanmean(y_after_spaghetti_feat, axis=0) )
-        ax1.plot(x_after, regression_after.predict(x_after.reshape(-1, 1)), color=color_ses, alpha=fit_alpha)
-      # Set x label for ax1
-      ax1.set_xlabel("Weeks Before and After {}".format(event_name))
-      fig.suptitle('Effect of {} Across SES'.format(event_name))
-      y_ses_all = y_ses[feat][1]
-      y_ses_all.extend(y_ses[feat][2])
-      y_ses_all.extend(y_ses[feat][3])
-      ymin = np.nanmin(y_ses_all) - 0.05
-      ymax = np.nanmax(y_ses_all) + 0.05
-      # Format plot
-      plt.ylabel("{} Z-Score".format(feat))
-      for ax in [ax1]:
-        ax.set_xticks(x)
-        ax.set_xticklabels(xticklabels, rotation=0)
-        ax.axis(ymin=ymin, ymax=ymax)
-        ax.legend()
-      fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-      plt_name = "rdd_plots_all/rdd_{}_{}_ses_{}.png".format(
-        num_counties_studied, feat.lower(), event_name.lower().replace(" ","_")
-      )
-      plt.savefig(filename=plt_name)  
+    def plot_by_subsection(subsections:dict, subsection_str:str="", colors:list=[]):
+      '''
+      subsections: dict of subsection_names and their counties (as fips codes)
+      colors: list of colors for each subsection
+      filename_str: string to append to the filename
+      '''
+      if not subsections:
+        print("No subsections to plot")
+        return
+      if not colors:
+        colors = ['red','blue','green','orange','purple','brown','pink','gray','olive','cyan'][:len(subsections)]
+      x = np.array(range(1, x_center + default_after_end_window + 1))
+      xticklabels = [x_i - x_center for x_i in x]
+      xticklabels[x_center-1] = ""
+      avg_alpha = 0.3
+      fit_alpha = 0.7
+      
+      for feat in list_features:
+        print("\nCreating Plot for",feat)
+        plt.clf()
+        fig, ax1 = plt.subplots(nrows=1, ncols=1) # Horizontally stacked plots
+        fig.set_size_inches(8, 6)
+        ax1.axvline(x=x_center, color='black', linestyle='--')
+        for i, (subsection_name, subsection_counties) in enumerate(subsections.items()):
+          subsection_color = colors[i]
+          x_before_subsection = []
+          y_before_subsection = []
+          x_after_subsection = []
+          y_after_subsection = []
+          x_subsection = []
+          y_subsection = []
+          for target in subsection_counties:
+            if target not in y_before_county[feat] or target not in y_after_county[feat]:
+              continue
+            x_before_subsection.append(x_before_county[feat][target])
+            y_before_subsection.append(y_before_county[feat][target])
+            x_after_subsection.append(x_after_county[feat][target])
+            y_after_subsection.append(y_after_county[feat][target])
+            x_subsection.append(x_county[feat][target])
+            y_subsection.append(y_county[feat][target])
+          print("-> Subsection",subsection_name)
+          x_before_spaghetti_feat = np.array(x_before_subsection)
+          y_before_spaghetti_feat = np.array(y_before_subsection)
+          x_after_spaghetti_feat = np.array(x_after_subsection)
+          y_after_spaghetti_feat = np.array(y_after_subsection)
+          #x_spaghetti_feat = np.array(x_subsection)
+          y_spaghetti_feat = np.array(y_subsection)
+          if event_buffer > 0:
+            x_before_spaghetti_feat = x_before_spaghetti_feat[:,:-event_buffer]
+            y_before_spaghetti_feat = y_before_spaghetti_feat[:,:-event_buffer]
+            x_after_spaghetti_feat = x_after_spaghetti_feat[:,event_buffer:]
+            y_after_spaghetti_feat = y_after_spaghetti_feat[:,event_buffer:]
+          x_before = x_before_spaghetti_feat[0]
+          x_after = x_after_spaghetti_feat[0]
+          # Plot average of All
+          ax1.plot(x, np.nanmean(y_spaghetti_feat, axis=0), color=subsection_color, linestyle='--', alpha=avg_alpha, label='{} Average'.format(subsection_name))
+          # Linear Regression Line Before, After, All
+          try:
+            regression_before = LinearRegression().fit( x_before.reshape(-1, 1), np.nanmean(y_before_spaghetti_feat, axis=0) )
+            ax1.plot(x_before, regression_before.predict(x_before.reshape(-1, 1)), color=subsection_color, alpha=fit_alpha)
+            regression_after = LinearRegression().fit( x_after.reshape(-1, 1), np.nanmean(y_after_spaghetti_feat, axis=0) )
+            ax1.plot(x_after, regression_after.predict(x_after.reshape(-1, 1)), color=subsection_color, alpha=fit_alpha)
+          except Exception as e:
+            print("Error with plotting",feat)
+            print(e)
+            continue
+        # Set x label for ax1
+        ax1.set_xlabel("Weeks Before and After {}".format(event_name))
+        fig.suptitle('Effect of {} Across {}'.format(event_name,subsection_str))
+        y_ses_all = y_ses[feat][1]
+        y_ses_all.extend(y_ses[feat][2])
+        y_ses_all.extend(y_ses[feat][3])
+        ymin = np.nanmin(y_ses_all) - 0.05
+        ymax = np.nanmax(y_ses_all) + 0.05
+        # Format plot
+        plt.ylabel("{} Z-Score".format(feat))
+        for ax in [ax1]:
+          ax.set_xticks(x)
+          ax.set_xticklabels(xticklabels, rotation=0)
+          ax.axis(ymin=ymin, ymax=ymax)
+          ax.legend()
+        fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt_name = "rdd_plots_all/rdd_{}_{}_{}_{}.png".format(
+          num_counties_studied, subsection_str, feat.lower(), event_name.lower().replace(" ","_")
+        )
+        plt.savefig(filename=plt_name)  
+        
+    # Create a plot for each subsection
+    ses_1_counties = [target for target in county_to_ses.keys() if county_to_ses[target] == 1]
+    ses_2_counties = [target for target in county_to_ses.keys() if county_to_ses[target] == 2]
+    ses_3_counties = [target for target in county_to_ses.keys() if county_to_ses[target] == 3]
+    plot_by_subsection({"SES 1":ses_1_counties,"SES 2":ses_2_counties,"SES 3":ses_3_counties}, "SES", colors=['red','blue','green'])
         
     
     # Create a pandas dataframe
     print("\nCreating Pandas Dataframe of Outcomes")
-    columns = ['fips','county','feat','event_name','event_date','event_date_centered','target_before_slope','target_after_slope','target_before_intercept','target_after_intercept','target_diff_slope','target_diff_intercept','slope_effect','intercept_effect']
+    columns = ['fips','county','feat','event_name','event_date','event_date_centered','target_before','target_after','target_before_slope','target_after_slope','target_before_intercept','target_after_intercept','target_diff_slope','target_diff_intercept','slope_effect','intercept_effect']
     output = pd.DataFrame(output_dicts)[columns]
     output = output.dropna()
     print(output.sort_values(by=['fips','feat']))
@@ -840,8 +1019,5 @@ with connection:
         corr = np.corrcoef(dat,output[col].loc[dat.index])[0,1]
         print("-> Correlation between {} and {} = {}".format(outcome,col,round(corr,4)))
     
-    # Plot amount change over time if not doing a randomization
-    if not randomize_events:
-      
-      # Write the output to a CSV
-      output.to_csv("rdd_data.csv",index=False)
+    # Write the output to a CSV
+    output.to_csv("rdd_{}_data.csv".format(event_name.lower().replace(" ","_")),index=False)
