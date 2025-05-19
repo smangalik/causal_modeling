@@ -2,6 +2,7 @@
 # Run as: python discontinuity_prediction.py
 import os
 
+import scipy.stats as stats
 import pandas as pd
 import numpy as np
 from scipy.stats import linregress
@@ -41,6 +42,7 @@ artifact_store = optuna.artifacts.FileSystemArtifactStore(base_path=artifact_bas
 
 first_case = "/users2/smangalik/causal_modeling/rdd_first_covid_case_FREEZE.csv"
 df = pd.read_csv(first_case)
+df['fips'] = df['fips'].astype(str).str.zfill(5)
 df_cov = df[df['feat']==score_cov]
 df = df[df['feat']==score]
 
@@ -51,26 +53,31 @@ print("Columns:",df.columns)
 print("\nRDD Dataframe with covariates, row count:", len(df_cov))
 
 # Load county embeddings
-county_embeddings_csv = "/users2/smangalik/causal_modeling/ctlb2.feat$roberta_la_meL23nosent_wavg$ctlb_2020$county.csv"
+#county_embeddings_csv = "/users2/smangalik/causal_modeling/ctlb2.feat$roberta_la_meL23nosent_wavg$ctlb_2020$county.csv"
 #county_embeddings_csv = "/users2/smangalik/causal_modeling/ctlb2.feat$roberta_la_meL23dlatk_avg$ctlb_2020$county.csv"
 #county_embeddings_csv = "/users2/smangalik/causal_modeling/ctlb2.feat$roberta_la_meL23nosent_avg$ctlb_2020$county.csv"
+# county_embeddings_csv = "/data/smangalik/county_embeddings/ctlb2.feat$roberta_la_meL23nosent_wavg$ctlb_2020$full_county_set.csv"
+county_embeddings_csv = "/data/smangalik/county_embeddings/final_county_wavg_emb_wide.csv"
 county_embeddings = pd.read_csv(county_embeddings_csv)
 county_embeddings = county_embeddings.rename(columns={'group_id':'fips'})
+county_embeddings['fips'] = county_embeddings['fips'].astype(str).str.zfill(5)
 embeddings_cols = [col for col in county_embeddings.columns if 'me' in col]
 print("Loaded", len(county_embeddings), "county embeddings from", county_embeddings_csv)
 print(county_embeddings)
 
 # mean of all the embedding columns in the dataframe
 df_mean = county_embeddings[embeddings_cols].mean()
-mean_embedding = [df_mean[col] for col in embeddings_cols]
-print("\nMean embedding length:", len(mean_embedding))
+#mean_embedding = [df_mean[col] for col in embeddings_cols]
+#print("\nMean embedding length:", len(mean_embedding))
 
 # Join with the dataframe
 df = df.merge(county_embeddings, on='fips', how='left')
 print("\nRDD Dataframe with embeddings, row count:", len(df))
 print(df.head())
 
-
+# Number of rows with NaN values in the embeddings
+nan_rows = df[df[embeddings_cols].isna().any(axis=1)]
+print("\nNumber of rows with NaN values in the embeddings:", len(nan_rows))
 
 def regress_missing_points(dat_x, dat_y):
     non_nan_indices = [i for i, value in zip(dat_x,dat_y) if not np.isnan(value)]
@@ -133,8 +140,8 @@ def generate_training_data(df:pd.DataFrame, df_cov:pd.DataFrame, buffer:int=0):
         # Find the first and last points of the regression lines
         regression_before_last =  intercept_before + (slope_before * -buffer)
         regression_after_first = intercept_after + (slope_after * buffer) 
-        regression_cov_before_last = intercept_cov_before + (slope_cov_before * -buffer)
-        regression_cov_after_first = intercept_cov_after + (slope_cov_after * buffer)
+        #regression_cov_before_last = intercept_cov_before + (slope_cov_before * -buffer)
+        #regression_cov_after_first = intercept_cov_after + (slope_cov_after * buffer)
         
         # print("\nRegression before last:", regression_before_last)
         # print("Regression after first:", regression_after_first)
@@ -161,8 +168,7 @@ def generate_training_data(df:pd.DataFrame, df_cov:pd.DataFrame, buffer:int=0):
         # The embedding of the county
         X_embedding_i = [row[col] for col in embeddings_cols]
         # If there are any NaN values in the embedding, assign the mean embedding
-        if np.isnan(X_embedding_i).any():
-            X_embedding_i = mean_embedding
+        #if np.isnan(X_embedding_i).any(): X_embedding_i = mean_embedding
         X_embedding.append(X_embedding_i)
         
         # print("\nX_i:", X_i)
@@ -1338,7 +1344,7 @@ def evaluate(X, y_df, outcomes=['Delta b','Delta m'], model_name='RidgeRegressio
     
     else:
         print("Unknown model:", model_name)
-        return
+        return None, None
     
     # Column-wise MSE
     for i, y_col in enumerate(outcomes):
@@ -1351,9 +1357,29 @@ def evaluate(X, y_df, outcomes=['Delta b','Delta m'], model_name='RidgeRegressio
             corr = np.corrcoef(y_pred_col, y_test_col)[0, 1]
         print(f"-> {y_col.replace(' ', '_')} MSE: {round(mse, 3):.3f} \tCorr: {round(corr, 3):.3f}")
         
+    residuals = abs(y_test - y_pred)
     if model_name in ['RidgeRegression','RandomForest','XGBoost','MLPRegressor']:
-        return grid_search.best_estimator_, y_pred
-        
+        return grid_search.best_estimator_, residuals
+    elif model_name in ['KNeighborsRegressor', 'FFN', 'GRU', 'GRU_GPU', 'Transformer', 'Transformer_GPU']:
+        return model, residuals
+    else:
+        return None, residuals
+    
+    
+def p_value_evaluate(res_better, res_control): 
+   
+    assert res_better.shape == res_control.shape, "Residuals must be of the same shape"
+    n = len(res_better)
+    p_vals = []
+    for i, y_col in enumerate(range(res_better.shape[1])):
+        y_fcra_diff = res_better[:, i] - res_control[:, i]
+        y_fcra_diff_mean= np.mean(y_fcra_diff)
+        y_fcra_sd = np.std(y_fcra_diff)
+        y_fcra_diff_t = abs( y_fcra_diff_mean / (y_fcra_sd / np.sqrt(n)) )
+        y_fcra_diff_p = stats.t.sf( y_fcra_diff_t, df = n-1 )
+        p_vals.append(y_fcra_diff_p)
+    return p_vals
+
     
 ##################################
 # Put your experiments below!
@@ -1364,29 +1390,30 @@ def evaluate(X, y_df, outcomes=['Delta b','Delta m'], model_name='RidgeRegressio
 evaluate(X, y, model_name='NoChange', run_name="No Change Baseline")
 
 # Always guess the mean value for each column
-evaluate(X, y, model_name='MeanBaseline', run_name="Mean Baseline")
+_, residuals_mean_baseline = evaluate(X, y, model_name='MeanBaseline', run_name="Mean Baseline")
 
 # Only use the P
-evaluate(X, y, model_name="RidgeRegression", run_name="P and Ridge")
-evaluate(X_line_params, y, model_name="RidgeRegression", run_name="RC and Ridge")
-evaluate(X_with_line_params, y, model_name="RidgeRegression", run_name="P + RC and Ridge")
+_, residuals_ridge_p = evaluate(X, y, model_name="RidgeRegression", run_name="P and Ridge")
+_, residuals_ridge_rc = evaluate(X_line_params, y, model_name="RidgeRegression", run_name="RC and Ridge")
+_, residuals_ridge_p_rc = evaluate(X_with_line_params, y, model_name="RidgeRegression", run_name="P + RC and Ridge")
 evaluate(X_with_cov, y, model_name="RidgeRegression", run_name="P + Cov and Ridge")
 evaluate(X_with_line_params_and_cov, y, model_name="RidgeRegression", run_name="P + RC + Cov and Ridge")
-evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="RidgeRegression", run_name="P + RC + Cov + Cov RC and Ridge")
+_, residuals_ridge_p_rc_cov = evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="RidgeRegression", run_name="P + RC + Cov + Cov RC and Ridge")
 
-evaluate(X_embedding, y, model_name="RidgeRegression", run_name="E and Ridge")
-evaluate(X_with_embedding, y, model_name="RidgeRegression", run_name="P + E and Ridge")
-evaluate(X_line_params_with_embedding, y, model_name="RidgeRegression", run_name="RC + E and Ridge")
-evaluate(X_with_line_params_and_embedding, y, model_name="RidgeRegression", run_name="P + RC + E and Ridge")
-evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="RidgeRegression", run_name="P + RC + Cov + Cov RC and Ridge")
-model, y_pred = evaluate(X_everything, y, model_name='RidgeRegression', run_name="Everything and Ridge")
+_, residuals_ridge_e = evaluate(X_embedding, y, model_name="RidgeRegression", run_name="E and Ridge")
+_, residuals_ridge_p_e = evaluate(X_with_embedding, y, model_name="RidgeRegression", run_name="P + E and Ridge")
+_, residuals_ridge_rc_e = evaluate(X_line_params_with_embedding, y, model_name="RidgeRegression", run_name="RC + E and Ridge")
+_, residuals_ridge_p_rc_e = evaluate(X_with_line_params_and_embedding, y, model_name="RidgeRegression", run_name="P + RC + E and Ridge")
+_, residuals_ridge_p_rc_cov = evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="RidgeRegression", run_name="P + RC + Cov + Cov RC and Ridge")
+_, residuals_ridge_p_rc_every = model, residuals = evaluate(X_everything, y, model_name='RidgeRegression', run_name="Everything and Ridge")
 
-# Test the P + LP model across SES3
+# Test the P + LP model across SES3 and urbanicity
+df['lnurban3'] = pd.qcut(df['lnurban'], 3, labels=["Rural", "Suburban", "Urban"])
 pred_df = pd.DataFrame(model.predict(X_everything), columns=['pred b', 'pred m'])
 pred_df = pd.concat([pred_df, y], axis=1)
 pred_df = pred_df.merge(df, on='county')
-# TODO make tertiles for lnurban
-for ses in df['ses3'].unique():
+print()
+for ses in pred_df['ses3'].unique():
     dat = pred_df[pred_df['ses3'] == ses]
     #print(f"SES3: {ses} -> Count: {len(dat)}")
     # Calculate the MSE and correlation for each SES3 group
@@ -1395,47 +1422,104 @@ for ses in df['ses3'].unique():
     corr_b = np.corrcoef(dat['pred b'], dat['Delta b'])[0, 1]
     corr_m = np.corrcoef(dat['pred m'], dat['Delta m'])[0, 1]
     print(f"SES{ses} (n={len(dat)})): -> Delta b MSE: {round(mse_b, 3)} \tDelta b Corr: {round(corr_b, 3)}")
+    print(f"SES{ses} (n={len(dat)})): -> Delta m MSE: {round(mse_m, 3)} \tDelta m Corr: {round(corr_m, 3)}")
+    # Mean and std of the predictions and true values
+    print(f"SES{ses} (n={len(dat)})): -> Delta b Mean: {round(np.mean(dat['pred b']), 3)} \tDelta b Std: {round(np.std(dat['pred b']), 3)}")
+    print(f"SES{ses} (n={len(dat)})): -> Delta m Mean: {round(np.mean(dat['pred m']), 3)} \tDelta m Std: {round(np.std(dat['pred m']), 3)}")
+print()
+for urbanicity in pred_df['lnurban3'].unique():
+    dat = pred_df[pred_df['lnurban3'] == urbanicity]
+    mse_b = np.mean((dat['pred b'] - dat['Delta b']) ** 2)
+    mse_m = np.mean((dat['pred m'] - dat['Delta m']) ** 2)
+    corr_b = np.corrcoef(dat['pred b'], dat['Delta b'])[0, 1]
+    corr_m = np.corrcoef(dat['pred m'], dat['Delta m'])[0, 1]
+    print(f"{urbanicity} (n={len(dat)})): -> Delta b MSE: {round(mse_b, 3)} \tDelta b Corr: {round(corr_b, 3)}")
+    print(f"{urbanicity} (n={len(dat)})): -> Delta m MSE: {round(mse_m, 3)} \tDelta m Corr: {round(corr_m, 3)}")
+    # Mean and std of the predictions and true values
+    print(f"{urbanicity} (n={len(dat)})): -> Delta b Mean: {round(np.mean(dat['pred b']), 3)} \tDelta b Std: {round(np.std(dat['pred b']), 3)}")
+    print(f"{urbanicity} (n={len(dat)})): -> Delta m Mean: {round(np.mean(dat['pred m']), 3)} \tDelta m Std: {round(np.std(dat['pred m']), 3)}")
 
+# K-Nearest Neighbors (KNN)
+_, residuals_knn_p_rc = evaluate(X_with_line_params, y, model_name="KNeighborsRegressor", run_name="P + RC and KNeighborsRegressor")
+_, residuals_knn_p_rc_cov = evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="KNeighborsRegressor", run_name="P + RC + Cov + Cov RC and KNeighborsRegressor")
+_, residuals_knn_p_rc_e = evaluate(X_with_line_params_and_embedding, y, model_name="KNeighborsRegressor", run_name="E + P + RC and KNeighborsRegressor")
+_, residuals_knn_p_rc_every = evaluate(X_everything, y, model_name="KNeighborsRegressor", run_name="Everything and KNeighborsRegressor")
 
 # Feed Forward Neural Network (FFN)
-evaluate(X_with_line_params, y, model_name="FFN", run_name="P + RC and FFN")
+_, residuals_fnn_p_rc = evaluate(X_with_line_params, y, model_name="FFN", run_name="P + RC and FFN")
 evaluate(X_with_line_params_and_embedding, y, model_name="FFN", run_name="E + P + RC and FFN")
-#evaluate(X_with_line_params_and_ses, y, model_name="FFN", run_name="P + RC + SES and optuna(FFN)")
 evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="FFN", run_name="P + RC + Cov + Cov RC and FFN")
 evaluate(X_everything, y, model_name="FFN", run_name="Everything and FFN")
 
 # GRU Model
-evaluate(X_with_line_params, y, model_name="GRU", run_name="P + RC and GRU")
-#evaluate(X_with_line_params_and_ses, y, model_name="GRU", run_name="P + RC + SES and GRU")
-evaluate(X_with_line_params_and_embedding, y, model_name="GRU_GPU", run_name="E + P + RC and GRU (on GPU)")
+_, residuals_gru_p_rc = evaluate(X_with_line_params, y, model_name="GRU", run_name="P + RC and GRU")
 evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="GRU_GPU", run_name="P + RC + Cov + Cov RC and GRU (on GPU)")
-evaluate(X_everything, y, model_name="GRU_GPU", run_name="Everything and GRU (on GPU)")
+evaluate(X_with_line_params_and_embedding, y, model_name="GRU_GPU", run_name="E + P + RC and GRU (on GPU)")
+_, residuals_gru_p_rc_every = evaluate(X_everything, y, model_name="GRU_GPU", run_name="Everything and GRU (on GPU)")
 
-# Transformer Model
-evaluate(X_with_line_params, y, model_name="Transformer", run_name="P + RC and Transformer")
-#evaluate(X_with_line_params_and_ses, y, model_name="Transformer", run_name="P + RC + SES and Transformer")
-evaluate(X_with_line_params_and_embedding, y, model_name="Transformer_GPU", run_name="E + P + RC and Transformer (on GPU)")
+# Transformer Mode
+_, residuals_trans_p_rc = evaluate(X_with_line_params, y, model_name="Transformer", run_name="P + RC and Transformer")
 evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="Transformer_GPU", run_name="P + RC + Cov + Cov RC and Transformer (on GPU)")
-evaluate(X_everything, y, model_name="Transformer_GPU", run_name="Everything and Transformer (on GPU)")
+evaluate(X_with_line_params_and_embedding, y, model_name="Transformer_GPU", run_name="E + P + RC and Transformer (on GPU)")
+_, residuals_trans_p_rc_every = evaluate(X_everything, y, model_name="Transformer_GPU", run_name="Everything and Transformer (on GPU)")
 
-
-evaluate(X_with_line_params, y, model_name="KNeighborsRegressor", run_name="P + RC and KNeighborsRegressor")
-#evaluate(X_with_line_params_and_embedding, y, model_name="KNeighborsRegressor", run_name="E + P + RC and KNeighborsRegressor")
-
-# Use the P and the RC and RandomForest
-evaluate(X_with_line_params, y, model_name="RandomForest", run_name="P + RC and RandomForest")
-#evaluate(X_with_line_params_and_embedding, y, model_name="RandomForest", run_name="E + P + RC and RandomForest")
+# RandomForest
+_, residuals_rf_p_rc = evaluate(X_with_line_params, y, model_name="RandomForest", run_name="P + RC and RandomForest")
+evaluate(X_with_line_params_and_embedding, y, model_name="RandomForest", run_name="E + P + RC and RandomForest")
 
 # # Use the P and the RC and XGBoost
-evaluate(X_with_line_params, y, model_name="XGBoost", run_name="P + RC and XGBoost")
-#evaluate(X_with_line_params_and_embedding, y, model_name="XGBoost", run_name="E + P + RC and XGBoost")
+_, residuals_xgb_p_rc = evaluate(X_with_line_params, y, model_name="XGBoost", run_name="P + RC and XGBoost")
+evaluate(X_with_line_params_and_embedding, y, model_name="XGBoost", run_name="E + P + RC and XGBoost")
 
 # Use the P and the RC and Extra Trees
-evaluate(X_with_line_params, y, model_name="ExtraTrees", run_name="P + RC and Extra Trees")
-evaluate(X_with_line_params_and_embedding, y, model_name="ExtraTrees", run_name="E + P + RC and Extra Trees")
-evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="ExtraTrees", run_name="P + RC + Cov + Cov RC and Extra Trees")
-evaluate(X_everything, y, model_name="ExtraTrees", run_name="Everything and Extra Trees")
+_, residuals_et_p_rc =  evaluate(X_with_line_params, y, model_name="ExtraTrees", run_name="P + RC and Extra Trees")
+_, residuals_et_p_rc_cov = evaluate(X_with_line_params_and_cov_and_cov_line_params, y, model_name="ExtraTrees", run_name="P + RC + Cov + Cov RC and Extra Trees")
+_, residuals_et_p_rc_e = evaluate(X_with_line_params_and_embedding, y, model_name="ExtraTrees", run_name="E + P + RC and Extra Trees")
+_, residuals_et_p_rc_every = evaluate(X_everything, y, model_name="ExtraTrees", run_name="Everything and Extra Trees")
 
 # # Use the P and the RC and sklearn MLP
 # evaluate(X_with_line_params, y, model_name="MLPRegressor", run_name="RC and sklearn MLP")
 # evaluate(X_with_line_params_and_embedding, y, model_name="MLPRegressor", run_name="E + P + LP and sklearn MLP")
+
+# Calculate p-values for the residuals
+
+print("\nTABLE 1")
+print("Mean vs Ridge", p_value_evaluate(residuals_ridge_p_rc, residuals_mean_baseline))
+print("Mean vs KNN", p_value_evaluate(residuals_knn_p_rc, residuals_mean_baseline))
+print("Mean vs FFN", p_value_evaluate(residuals_fnn_p_rc, residuals_mean_baseline))
+print("Mean vs RandomForest", p_value_evaluate(residuals_rf_p_rc, residuals_mean_baseline))
+print("Mean vs ExtraTrees", p_value_evaluate(residuals_et_p_rc, residuals_mean_baseline))
+print("Mean vs XGBoost", p_value_evaluate(residuals_xgb_p_rc, residuals_mean_baseline))
+
+print("\nTABLE 2")
+print("Mean vs Ridge", p_value_evaluate(residuals_ridge_p_rc, residuals_mean_baseline))
+print("Ridge vs Ridge + Cov", p_value_evaluate(residuals_ridge_p_rc_cov, residuals_ridge_p_rc))
+print("Ridge vs Ridge + E", p_value_evaluate(residuals_ridge_p_rc_e, residuals_ridge_p_rc))
+print("Ridge vs Ridge + Everything", p_value_evaluate(residuals_ridge_p_rc_every, residuals_ridge_p_rc))
+print("Mean vs KNN", p_value_evaluate(residuals_knn_p_rc, residuals_mean_baseline))
+print("KNN vs KNN + Cov", p_value_evaluate(residuals_knn_p_rc_cov, residuals_knn_p_rc))
+print("KNN vs KNN + E", p_value_evaluate(residuals_knn_p_rc_e, residuals_knn_p_rc))
+print("KNN vs KNN + Everything", p_value_evaluate(residuals_knn_p_rc_every, residuals_knn_p_rc))
+print("Mean vs ExtraTrees", p_value_evaluate(residuals_et_p_rc, residuals_mean_baseline))
+print("ExtraTrees vs ExtraTrees + Cov", p_value_evaluate(residuals_et_p_rc_cov, residuals_et_p_rc))
+print("ExtraTrees vs ExtraTrees + E", p_value_evaluate(residuals_et_p_rc_e, residuals_et_p_rc))
+print("ExtraTrees vs ExtraTrees + Everything", p_value_evaluate(residuals_et_p_rc_every, residuals_et_p_rc))
+
+print("\nTABLE 3")
+print("Mean vs ExtraTrees", p_value_evaluate(residuals_et_p_rc, residuals_mean_baseline))
+print("ExtraTrees vs ExtraTrees + Everything", p_value_evaluate(residuals_et_p_rc_every, residuals_et_p_rc))
+print("Mean vs Transformer", p_value_evaluate(residuals_trans_p_rc, residuals_mean_baseline))
+print("Transformer vs Transformer + Everything", p_value_evaluate(residuals_trans_p_rc_every, residuals_trans_p_rc))
+print("Mean vs GRU", p_value_evaluate(residuals_gru_p_rc, residuals_mean_baseline))
+print("GRU vs GRU + Everything", p_value_evaluate(residuals_gru_p_rc_every, residuals_gru_p_rc))
+
+print("\nTABLE 5")
+print("Mean vs Ridge RC", p_value_evaluate(residuals_ridge_rc, residuals_mean_baseline))
+print("Mean vs Ridge P", p_value_evaluate(residuals_ridge_p, residuals_mean_baseline))
+print("Mean vs Ridge P+RC", p_value_evaluate(residuals_ridge_p_rc, residuals_mean_baseline))
+print("Mean vs Ridge E", p_value_evaluate(residuals_ridge_e, residuals_mean_baseline))
+print("Mean vs Ridge E+RC", p_value_evaluate(residuals_ridge_rc_e, residuals_mean_baseline))
+print("Mean vs Ridge E+P", p_value_evaluate(residuals_ridge_p_e, residuals_mean_baseline))
+print("Mean vs Ridge P+RC+E", p_value_evaluate(residuals_ridge_p_rc_e, residuals_mean_baseline))
+print("Mean vs Ridge P+RC+Cov", p_value_evaluate(residuals_ridge_p_rc_cov, residuals_mean_baseline))
+print("Mean vs Ridge Everything", p_value_evaluate(residuals_ridge_p_rc_every, residuals_mean_baseline))

@@ -720,7 +720,7 @@ with connection:
         #ax2.plot(x, regression.predict(x.reshape(-1, 1)), color='green', linestyle='--', alpha=0.3, label='All Fit')
         
         # Set x label for ax1
-        ax1.set_xlabel("Weeks Before and After Event", fontsize=14)
+        ax1.set_xlabel("Weeks Before and After Event", fontsize=18)
         #ax2.set_xlabel("Weeks Before and After Event")
         
         slope_change = regression_after.coef_[0] - regression_before.coef_[0]
@@ -739,7 +739,7 @@ with connection:
         ymax = max([max([y for y in y_vals if y is not None])]) + margin
 
         # Format plot
-        plt.ylabel("County {} Z-Score".format(feat), fontsize=14)
+        plt.ylabel("County {} Z-Score".format(feat), fontsize=18)
         for ax in [ax1]: # ax2]:
           ax.set_xticks(x)
           ax.set_xticklabels(xticklabels, rotation=0)
@@ -808,8 +808,8 @@ with connection:
         print(e)
         continue
       # Set x label for ax1
-      ax1.set_xlabel("Weeks Before and After Event", fontsize=14)
-      ax2.set_xlabel("Weeks Before and After Event", fontsize=14)
+      ax1.set_xlabel("Weeks Before and After Event", fontsize=18)
+      ax2.set_xlabel("Weeks Before and After Event", fontsize=18)
       slope_change = regression_after.coef_[0] - regression_before.coef_[0]
       intercept_change = regression_after.intercept_ - regression_before.intercept_
       fig.suptitle('Effect of {} (Discontinuity: {} D. Slope: {})'.format(
@@ -824,7 +824,7 @@ with connection:
       ymin = min([min([y for y in y_all_feat if y is not None])]) - margin
       ymax = max([max([y for y in y_all_feat if y is not None])]) + margin
       # Format plot
-      plt.ylabel("{} Z-Score".format(feat), fontsize=14)
+      plt.ylabel("{} Z-Score".format(feat), fontsize=18)
       for ax in [ax1, ax2]:
         ax.set_xticks(x)
         ax.set_xticklabels(xticklabels, rotation=0)
@@ -869,7 +869,7 @@ with connection:
       fit_alpha = 0.5
       plt.clf() # reset old plot
       fig, ax1 = plt.subplots(nrows=1, ncols=1) # Horizontally stacked plots
-      fig.set_size_inches(8, 6)
+      fig.set_size_inches(7, 5)
       # # Spaghetti (very thin) Plots
       # for x_line, y_line in zip(x_before_spaghetti_feat, y_before_spaghetti_feat):
       #   ax1.plot(x_line, y_line, color='red', alpha=line_alpha)
@@ -927,7 +927,7 @@ with connection:
       ax1.axvline(x=0, color='black', linestyle='--')
       #ax2.axvline(x=x_center, color='black', linestyle='--')
       # Set x label for ax1
-      ax1.set_xlabel("Weeks Before and After {}".format(event_name), fontsize=14)
+      ax1.set_xlabel("Weeks Before and After {}".format(event_name), fontsize=18)
       #ax2.set_xlabel("Weeks Before and After {}".format(event_name))
       slope_change = regression_after.coef_[0] - regression_before.coef_[0]
       intercept_change = regression_after.intercept_ - regression_before.intercept_
@@ -944,7 +944,7 @@ with connection:
       ymin = np.nanmin(mean_line) - margin
       ymax = np.nanmax(mean_line) + margin
       # Format plot
-      plt.ylabel("{} Z-Score".format(feat), fontsize=14)
+      plt.ylabel("{} Z-Score".format(feat), fontsize=18)
       for ax in [ax1]:
         ax.set_xticks(x)
         ax.set_xticklabels(xticklabels, rotation=0)
@@ -979,10 +979,16 @@ with connection:
         print("\nCreating Plot for",feat)
         plt.clf()
         fig, ax1 = plt.subplots(nrows=1, ncols=1) # Horizontally stacked plots
-        fig.set_size_inches(8, 6)
+        fig.set_size_inches(7, 5)
         ax1.axvline(x=0, color='black', linestyle='--')
         for i, (subsection_name, subsection_counties) in enumerate(subsections.items()):
           subsection_color = colors[i]
+          if 'low' in subsection_name.lower():
+            subsection_color = "red"
+          elif 'med' in subsection_name.lower():
+            subsection_color = "blue"
+          elif 'high' in subsection_name.lower():
+            subsection_color = "green"
           line_style = line_styles[i]
           x_before_subsection = []
           y_before_subsection = []
@@ -1026,7 +1032,7 @@ with connection:
             print(e)
             continue
         # Set x label for ax1
-        ax1.set_xlabel("Weeks Before and After {}".format(event_name), fontsize=14)
+        ax1.set_xlabel("Weeks Before and After {}".format(event_name), fontsize=18)
         fig.suptitle('Effect of {} Per {}'.format(event_name,subsection_str), fontsize=16)
         y_ses_all = y_ses[feat][1]
         y_ses_all.extend(y_ses[feat][2])
@@ -1037,7 +1043,7 @@ with connection:
         ymax = np.nanmax(mean_line) + margin
         print("-> Y Min:",ymin,"Y Max:",ymax)
         # Format plot
-        plt.ylabel("{} Z-Score".format(feat), fontsize=14)
+        plt.ylabel("{} Z-Score".format(feat), fontsize=18)
         for ax in [ax1]:
           ax.set_xticks(x)
           ax.set_xticklabels(xticklabels, rotation=0, fontsize=10)
@@ -1098,7 +1104,7 @@ with connection:
     plot_by_subsection({"Low Urbanicity":output_urban_low['fips'].tolist(),
                         "Med Urbanicity":output_urban_med['fips'].tolist(),
                         "High Urbanicity":output_urban_high['fips'].tolist()}, 
-                        "Urbanicity Tercile")
+                        "Urbanicity Tertiles")
     
     # Terciles for ses
     output['ses_tercile'] = pd.qcut(x=output['ses'], q=3, labels=['low','med','high'])
@@ -1108,7 +1114,7 @@ with connection:
     plot_by_subsection({"Low SES":output_ses_low['fips'].tolist(),
                         "Med SES":output_ses_med['fips'].tolist(),
                         "High SES":output_ses_high['fips'].tolist()}, 
-                        "Socioeconomic Tercile")
+                        "Socioeconomic Tertiles")
 
     
     # Correlation between SES and Intervention Effect
